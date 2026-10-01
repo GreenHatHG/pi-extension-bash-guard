@@ -1,9 +1,11 @@
 /**
  * pi-extension-bash-guard
  *
- * 两件事：
+ * 三件事：
  * 1. 会话开局注入一次 `[BASH OUTPUT DISCIPLINE]`，让模型主动写出有界输出。
- * 2. `tool_result` 阶段拦截 bash/powershell 的大输出，替换成
+ * 2. `tool_call` 阶段：拦截根目录为 `$HOME`/`/`/系统目录（`/etc` 等）的 find/grep/rg；
+ *    并给搜索类命令注入 5 分钟超时上限（缺 `timeout` 或超过 300 秒都压到 300）。
+ * 3. `tool_result` 阶段拦截 bash/powershell 的大输出，替换成
  *    「少量核心行 + 全文落盘路径 + 针对性重写建议」，逼模型重写命令。
  *
  * 设计约束（与 plan-mode 一致）：不修改 systemPrompt、不动工具集、不注册 `context`
@@ -11,12 +13,14 @@
  */
 
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { assessOutput, describeLimit } from "./analyze";
 import { CONFIG_CUSTOM_TYPE, type GuardConfig, loadEnvConfig, parseCommandArgs, readPersistedConfig } from "./config";
 import { buildGuardMessage } from "./guard-message";
+import { detectBlockedScan } from "./scan-guard";
+import { isSearchCommand, SEARCH_TIMEOUT_SECONDS, searchTimeoutInjection } from "./timeout-guard";
 
 /** 状态栏 key。 */
 const STATUS_KEY = "bash-guard";
@@ -26,6 +30,18 @@ const FRAMING_CUSTOM_TYPE = "bash-guard-framing";
 const GUARDED_TOOLS = new Set(["bash", "powershell"]);
 /** 已拦截命令集合的上限，超过则清空，避免无限增长。 */
 const MAX_TRACKED_COMMANDS = 200;
+/** pi bash 超时错误的标志（如 `Command timed out after 600 seconds`）。 */
+const TIMEOUT_SIGNAL = /timed out after \d+ seconds/i;
+/**
+ * 命中 timeout 且输出很小（未触发尺寸拦截）时追加的引导。
+ *
+ * 只对搜索命令使用：只有搜索类命令会被本插件静默封顶到 300s，模型看不到这次改写；
+ * 其他命令的超时来自模型/用户显式设置的 `timeout`，pi 的原始报错已足够，无需打扰。
+ */
+const TIMEOUT_HINT =
+	"[BASH TIMEOUT GUARD] Search commands are capped at 300s by bash-guard. Raising the timeout past 300s won't help — the cap is re-applied " +
+	"(a smaller explicit timeout is honored). This scan was killed mid-run, so its results may be incomplete. Narrow it instead: " +
+	"`rg -l <pattern> <dir>` with `-g '!**/node_modules/**'` exclusions (a trailing `| grep -v dir` still reads every file), or use `mdfind -name`.";
 
 /** 归一化命令用于「同一命令重复触发」判定。 */
 export function normalizeCommand(command: string): string {
@@ -35,6 +51,10 @@ export function normalizeCommand(command: string): string {
 /** 开局注入的输出纪律文案。 */
 export function buildDisciplineText(cfg: GuardConfig): string {
 	const limit = describeLimit(cfg);
+	const timeoutLine =
+		"Search commands (`find`, recursive `grep`, `rg`, `du`, `tree`) are capped at 5 minutes (300 seconds) automatically; " +
+		"scans rooted at `$HOME`, `/`, or a system directory like `/etc` are blocked before they run. " +
+		"Everything else runs with no timeout guard — pass an explicit `timeout` for anything that can hang (log follow, foreground servers).";
 	return [
 		"[BASH OUTPUT DISCIPLINE]",
 		`An extension guards shell output. Any bash/powershell result above ${limit} is replaced with a short preview, ` +
@@ -46,8 +66,13 @@ export function buildDisciplineText(cfg: GuardConfig): string {
 		"- Logs/lists: `tail -n 50`, `git log --oneline -n 20`, `git diff --stat`, `ls | head`.",
 		"- Aggregate first: `| wc -l`, `| sort | uniq -c`, `-q`/`--quiet`/`-s`. Write big output to a file, then read/grep it selectively.",
 		"",
+		timeoutLine,
+		"",
 		"When a result starts with `[BASH OUTPUT GUARD]`: do NOT re-run the same command and do NOT pipe it to `less`/`more`. " +
 			"Rewrite it with tighter filters, or query the saved full-output file with the `read` tool (offset/limit) or `rg`/`sed`.",
+		"",
+		"Unbounded scans rooted at `$HOME`, `/`, or a system directory like `/etc` are blocked before they run. Scope to a project directory " +
+			"(`rg -l <pattern> ~/Projects`) or use `mdfind -name '<name>'`; add `-g '!Library/**'` if you must search all of `~`.",
 	].join("\n");
 }
 
@@ -139,6 +164,43 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		};
 	});
 
+	// ── 事前拦截：根目录为 $HOME、/ 或系统目录的无界扫描 ───────────
+	pi.on("tool_call", (event, ctx) => {
+		if (!cfg.enabled) return;
+		if (!GUARDED_TOOLS.has(event.toolName)) return;
+		const input = event.input as { command?: unknown; timeout?: unknown } | undefined;
+		const command = typeof input?.command === "string" ? input.command : "";
+		if (command === "") return;
+
+		if (cfg.scanBlock) {
+			const hit = detectBlockedScan(command, { home: homedir() });
+			if (hit) {
+				try {
+					ctx.ui.notify(`Blocked unbounded scan: ${hit.tool} → ${hit.root}`, "warning");
+				} catch {
+					// 无 UI 环境：忽略
+				}
+				return { block: true, reason: hit.reason };
+			}
+		}
+
+		// 搜索命令封顶 5 分钟：pi 的 `tool_call` input 可变，原地改写 `timeout`。
+		// 缺 `timeout` 或超过 300 秒都压到 300；模型给了更小的值则保留。
+		const injection = searchTimeoutInjection(command, input ?? {});
+		if (injection !== null && input) {
+			const had = typeof input.timeout === "number" ? input.timeout : undefined;
+			input.timeout = injection;
+			if (had !== undefined && had > SEARCH_TIMEOUT_SECONDS) {
+				try {
+					ctx.ui.notify(`Capped search timeout ${had}s → ${injection}s`, "warning");
+				} catch {
+					// 无 UI 环境：忽略
+				}
+			}
+		}
+		return;
+	});
+
 	// ── 超阈值硬拦截 ───────────────────────────────────────────────
 	pi.on("tool_result", async (event, ctx) => {
 		if (!cfg.enabled) return;
@@ -147,11 +209,20 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		if (textParts.length === 0) return;
 		const text = textParts.map((part) => (part.type === "text" ? part.text : "")).join("\n");
 
-		const assessment = assessOutput(text, cfg);
-		if (!assessment.exceeded) return;
-
 		const input = event.input as { command?: unknown } | undefined;
 		const command = typeof input?.command === "string" ? input.command : "";
+
+		const assessment = assessOutput(text, cfg);
+		if (!assessment.exceeded) {
+			// 超时错误通常输出很小，阈值拦不到。只有搜索命令会被本插件静默封顶到 300s，
+			// 模型看不到这次改写，才有必要补一句引导；其他命令的超时来自模型/用户显式
+			// 设置的 `timeout`，pi 的原始报错已足够，不打扰。
+			if (event.isError && TIMEOUT_SIGNAL.test(text) && isSearchCommand(command)) {
+				return { content: [{ type: "text" as const, text: `${text}\n\n${TIMEOUT_HINT}` }] };
+			}
+			return;
+		}
+
 		const details = event.details as OutputDetails | undefined;
 		const builtinTruncated = Boolean(details?.truncation);
 
@@ -183,7 +254,8 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 
 	// ── /bash-guard 配置命令 ───────────────────────────────────────
 	pi.registerCommand("bash-guard", {
-		description: "Toggle or configure the bash output guard (on | off | status | bytes <n> | preview <head> [tail])",
+		description:
+			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | bytes <n> | preview <head> [tail])",
 		handler: async (args, ctx) => {
 			const result = parseCommandArgs(args, cfg);
 			if (result.kind === "error") {
@@ -192,7 +264,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 			}
 			if (result.kind === "status") {
 				ctx.ui.notify(
-					`bash-guard: ${cfg.enabled ? "on" : "off"}; limit ${describeLimit(cfg)}; ` +
+					`bash-guard: ${cfg.enabled ? "on" : "off"}; limit ${describeLimit(cfg)}; scan-block ${cfg.scanBlock ? "on" : "off"}; ` +
 						`preview head ${cfg.previewHead} / tail ${cfg.previewTail} (errors ${cfg.errorPreviewTail}); hits ${hitCount}`,
 					"info",
 				);

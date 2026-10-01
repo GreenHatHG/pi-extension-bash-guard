@@ -25,6 +25,13 @@ const RULES: Rule[] = [
 			"`sed -n '1,80p' <file>` or `head -n 80 <file>`.",
 	},
 	{
+		// 递归搜索 + 事后 grep -v 目录过滤：应在遍历前排除
+		test: (c) => /(^|[\s|;&(])(grep\s+-[A-Za-z]*r|rg)\b/.test(c) && /\|\s*grep\s+-v\b/.test(c),
+		hint:
+			"Exclude before traversing, not after: `rg -g '!**/sessions/**' -g '!**/.git/**' <pattern> <dir>` " +
+			"(or `grep --exclude-dir=.git --exclude-dir=node_modules -r`). A trailing `| grep -v dir` still reads every file.",
+	},
+	{
 		// rg / grep 没有限量开关
 		test: (c) =>
 			/(^|[\s|;&(])(rg|grep)\b/.test(c) &&

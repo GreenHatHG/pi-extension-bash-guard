@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { createMockRuntime, type MockRuntime } from "./helpers/mockPi";
 
@@ -128,6 +129,171 @@ describe("tool_result 拦截", () => {
 		const rt = await setup();
 		await rt.runToolResult({ text: bigOutput(200), command: "cmd" });
 		expect(rt.statusBars.get("bash-guard")).toContain("×1");
+	});
+});
+
+describe("tool_call 无界扫描事前拦截", () => {
+	const toolCall = (rt: MockRuntime, command: string, timeout?: number) => {
+		const input: { command: string; timeout?: number } = { command };
+		if (timeout !== undefined) input.timeout = timeout;
+		return rt.emit("tool_call", { toolName: "bash", input });
+	};
+
+	test("根目录为 / 的 rg 被 block，并给出收窄建议", async () => {
+		const rt = await setup();
+		const res = await toolCall(rt, "rg foo /");
+		expect(res?.block).toBe(true);
+		expect(res?.reason).toContain("[BASH SCAN GUARD]");
+		expect(res?.reason).toContain("mdfind");
+	});
+
+	test("根目录为 $HOME 的 find 被 block", async () => {
+		const rt = await setup();
+		const res = await toolCall(rt, `find ${homedir()} -name x`);
+		expect(res?.block).toBe(true);
+	});
+
+	test("收窄到子目录放行", async () => {
+		const rt = await setup();
+		// `rg foo ~/Projects` 不是整个 home，scan-guard 不拦；仅注入 5 分钟封顶（不 block）。
+		expect(await toolCall(rt, "rg foo ~/Projects")).toBeUndefined();
+	});
+
+	test("根目录为系统目录 /etc 的 rg 被 block", async () => {
+		const rt = await setup();
+		const res = await toolCall(rt, "rg foo /etc");
+		expect(res?.block).toBe(true);
+		expect(res?.reason).toContain("/etc");
+	});
+
+	test("非 bash/powershell 工具放行", async () => {
+		const rt = await setup();
+		expect(await rt.emit("tool_call", { toolName: "read", input: { command: "rg foo /" } })).toBeUndefined();
+	});
+
+	test("scan off 后放行", async () => {
+		const rt = await setup();
+		await rt.runCommand("bash-guard", "scan off");
+		// scan-guard 关掉后 `rg foo /` 不再 block（只剩 5 分钟封顶，不 block）
+		expect(await toolCall(rt, "rg foo /")).toBeUndefined();
+	});
+
+	test("总开关 off 后放行", async () => {
+		const rt = await setup();
+		await rt.runCommand("bash-guard", "off");
+		expect(await toolCall(rt, "rg foo /")).toBeUndefined();
+	});
+
+	test("scan 开关持久化进会话条目", async () => {
+		const rt = await setup();
+		await rt.runCommand("bash-guard", "scan off");
+		const entry = rt.sessionEntries.filter((e) => e.customType === "bash-guard-config").at(-1);
+		expect((entry?.data as any)?.scanBlock).toBe(false);
+	});
+});
+
+describe("tool_call 搜索命令超时封顶", () => {
+	const emitCall = async (rt: MockRuntime, command: string, timeout?: number) => {
+		const input: { command: string; timeout?: number } = { command };
+		if (timeout !== undefined) input.timeout = timeout;
+		const res = await rt.emit("tool_call", { toolName: "bash", input });
+		return { res, input };
+	};
+
+	test("无 timeout 的搜索命令被注入 300 秒且不 block", async () => {
+		const rt = await setup();
+		const { res, input } = await emitCall(rt, "rg foo src");
+		expect(res).toBeUndefined();
+		expect(input.timeout).toBe(300);
+	});
+
+	test("显式大于 300 的搜索命令压到 300", async () => {
+		const rt = await setup();
+		const { input } = await emitCall(rt, 'rg -n "x" src tests | head -30', 900);
+		expect(input.timeout).toBe(300);
+	});
+
+	test("显式小于 300 的搜索命令保留原值（300 是上限不是覆盖）", async () => {
+		const rt = await setup();
+		const { input } = await emitCall(rt, "rg foo src", 60);
+		expect(input.timeout).toBe(60);
+	});
+
+	test("非搜索命令完全不动（不注入 timeout）", async () => {
+		const rt = await setup();
+		const { res, input } = await emitCall(rt, "git status");
+		expect(res).toBeUndefined();
+		expect(input.timeout).toBeUndefined();
+	});
+
+	test("非搜索命令的 input 对象整体未被改写", async () => {
+		const rt = await setup();
+		const input: { command: string; timeout?: number } = { command: "tail -f app.log" };
+		const before = { ...input };
+		await rt.emit("tool_call", { toolName: "bash", input });
+		expect(input).toEqual(before);
+		expect(Object.keys(input)).toEqual(["command"]);
+	});
+
+	test("非搜索命令显式的大 timeout 也不动（全放开）", async () => {
+		const rt = await setup();
+		const { input } = await emitCall(rt, "pnpm install", 999999);
+		expect(input.timeout).toBe(999999);
+	});
+
+	test("scan off 时封顶仍生效（两个开关独立）", async () => {
+		const rt = await setup();
+		await rt.runCommand("bash-guard", "scan off");
+		const { input } = await emitCall(rt, "rg foo src");
+		expect(input.timeout).toBe(300);
+	});
+
+	test("总开关 off 时完全不动", async () => {
+		const rt = await setup();
+		await rt.runCommand("bash-guard", "off");
+		const { res, input } = await emitCall(rt, "rg foo src");
+		expect(res).toBeUndefined();
+		expect(input.timeout).toBeUndefined();
+	});
+
+	test("第二个事故命令：递归 grep 无 timeout 被压到 300（不再跑 86 分钟）", async () => {
+		const rt = await setup();
+		// 根目录为 ~/.pi、~/Projects、~/ensoai —— 非 $HOME/`/`，scan-guard 不 block；
+		// 但它是搜索命令，封顶 5 分钟。
+		const command =
+			`grep -rln "@pi_running\\|@pi_win\\|@pi_total" ${homedir()}/.pi ${homedir()}/Projects ${homedir()}/ensoai 2>/dev/null ` +
+			`| grep -v "/sessions/" | grep -v "\\.git/" | head -30`;
+		const { res, input } = await emitCall(rt, command);
+		expect(res).toBeUndefined();
+		expect(input.timeout).toBe(300);
+	});
+});
+
+describe("timeout 错误引导", () => {
+	test("搜索命令的超时错误被追加改写引导", async () => {
+		const rt = await setup();
+		const result = await rt.runToolResult({
+			text: "Command timed out after 600 seconds",
+			command: "rg foo .",
+			isError: true,
+		});
+		expect(resultText(result)).toContain("[BASH TIMEOUT GUARD]");
+	});
+
+	test("非搜索命令的超时不被改写（超时非本插件造成）", async () => {
+		const rt = await setup();
+		const result = await rt.runToolResult({
+			text: "Command timed out after 600 seconds",
+			command: "npm run build",
+			isError: true,
+		});
+		expect(result).toBeUndefined();
+	});
+
+	test("非超时的普通错误不被改写", async () => {
+		const rt = await setup();
+		const result = await rt.runToolResult({ text: "some small failure", command: "false", isError: true });
+		expect(result).toBeUndefined();
 	});
 });
 
