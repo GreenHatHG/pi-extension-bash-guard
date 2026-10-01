@@ -17,6 +17,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { assessOutput, describeLimit } from "./analyze";
+import { classifyCommand } from "./classify";
 import { CONFIG_CUSTOM_TYPE, type GuardConfig, loadEnvConfig, parseCommandArgs, readPersistedConfig } from "./config";
 import { buildGuardMessage } from "./guard-message";
 import { detectBlockedScan } from "./scan-guard";
@@ -50,26 +51,30 @@ export function normalizeCommand(command: string): string {
 
 /** 开局注入的输出纪律文案。 */
 export function buildDisciplineText(cfg: GuardConfig): string {
-	const limit = describeLimit(cfg);
+	const exhaustLimit = describeLimit({ maxBytes: cfg.maxBytes });
+	const payloadLimit = describeLimit({ maxBytes: cfg.payloadMaxBytes });
 	const timeoutLine =
 		"Search commands (`find`, recursive `grep`, `rg`, `du`, `tree`) are capped at 5 minutes (300 seconds) automatically; " +
 		"scans rooted at `$HOME`, `/`, or a system directory like `/etc` are blocked before they run. " +
 		"Everything else runs with no timeout guard — pass an explicit `timeout` for anything that can hang (log follow, foreground servers).";
 	return [
 		"[BASH OUTPUT DISCIPLINE]",
-		`An extension guards shell output. Any bash/powershell result above ${limit} is replaced with a short preview, ` +
-			"the error/warning lines, and a path to the full output. Treat that as a nudge to rewrite the command, not as a failure.",
+		`An extension guards shell output. Search/listing/dump commands (e.g. \`rg\`, recursive \`grep\`, \`find\`, \`ls -R\`, ` +
+			`\`env\`, \`ps\`, \`git log\`) are capped at ${exhaustLimit}; other commands are capped at ${payloadLimit}. ` +
+			"Above the cap, the result is replaced with a short preview, the error/warning lines, and a path to the full output. " +
+			"Treat it as a nudge to rewrite the command, or to read the file, not as a failure.",
 		"",
 		"Bound output before you run:",
-		"- Search: prefer the grep/find tools, or use `rg -n -m 5 <pattern> <path>`, `rg -l` (files only), `rg -c` (counts). Never scan a huge tree unbounded.",
+		"- Content search: use the `grep` tool (`limit` caps matches; it respects .gitignore). In bash, `rg -l` lists matching files only, `-c` counts per file, `-m 5` caps matches per file. Never scan a huge tree unbounded.",
 		"- Read files: use the `read` tool with offset/limit. For spot checks use `sed -n '1,80p' <file>` or `head -n 80 <file>` — not `cat`.",
 		"- Logs/lists: `tail -n 50`, `git log --oneline -n 20`, `git diff --stat`, `ls | head`.",
 		"- Aggregate first: `| wc -l`, `| sort | uniq -c`, `-q`/`--quiet`/`-s`. Write big output to a file, then read/grep it selectively.",
 		"",
 		timeoutLine,
 		"",
-		"When a result starts with `[BASH OUTPUT GUARD]`: do NOT re-run the same command and do NOT pipe it to `less`/`more`. " +
-			"Rewrite it with tighter filters, or query the saved full-output file with the `read` tool (offset/limit) or `rg`/`sed`.",
+		"When a result starts with `[BASH OUTPUT GUARD]`: if it says output was withheld, rewrite the command with tighter filters. " +
+			"If it says a large result was saved to disk, read the parts you need from that file with the `read` tool (offset/limit) or the `grep` tool. " +
+			"Do NOT re-run the same command and do NOT pipe it to `less`/`more`.",
 		"",
 		"Unbounded scans rooted at `$HOME`, `/`, or a system directory like `/etc` are blocked before they run. Scope to a project directory " +
 			"(`rg -l <pattern> ~/Projects`) or use `mdfind -name '<name>'`; add `-g '!Library/**'` if you must search all of `~`.",
@@ -103,6 +108,7 @@ async function resolveFullOutputPath(
 export default function bashGuardExtension(pi: ExtensionAPI): void {
 	let cfg = loadEnvConfig();
 	let hitCount = 0;
+	let exhaustHits = 0;
 	let framingDelivered = false;
 	const guardedCommands = new Set<string>();
 	const tempDirs = new Set<string>();
@@ -131,6 +137,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	// ── 会话恢复：重放配置与 framing 闩锁，重置统计 ─────────────────
 	pi.on("session_start", (_event, ctx) => {
 		hitCount = 0;
+		exhaustHits = 0;
 		framingDelivered = false;
 		guardedCommands.clear();
 		const branch = ctx.sessionManager?.getBranch?.() ?? [];
@@ -212,7 +219,11 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		const input = event.input as { command?: unknown } | undefined;
 		const command = typeof input?.command === "string" ? input.command : "";
 
-		const assessment = assessOutput(text, cfg);
+		const commandClass = classifyCommand(command);
+		// 过程输出用紧阈值（maxBytes），其余按高价值载荷用宽阈值（payloadMaxBytes）。
+		// 两档各自独立：任一为 0 表示该档不限制字节；总开关是 `cfg.enabled`。
+		const effectiveLimit = commandClass === "exhaust" ? cfg.maxBytes : cfg.payloadMaxBytes;
+		const assessment = assessOutput(text, { maxBytes: effectiveLimit });
 		if (!assessment.exceeded) {
 			// 超时错误通常输出很小，阈值拦不到。只有搜索命令会被本插件静默封顶到 300s，
 			// 模型看不到这次改写，才有必要补一句引导；其他命令的超时来自模型/用户显式
@@ -228,11 +239,16 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 
 		const fullPath = await resolveFullOutputPath(text, details, builtinTruncated, tempDirs);
 
-		const normalized = normalizeCommand(command);
-		const repeatCommand = normalized !== "" && guardedCommands.has(normalized);
-		if (normalized !== "") {
-			if (guardedCommands.size >= MAX_TRACKED_COMMANDS) guardedCommands.clear();
-			guardedCommands.add(normalized);
+		// 只有「过程输出」参与重复提示与升级警告；高价值载荷被反复读取是合理的。
+		let repeatCommand = false;
+		if (commandClass === "exhaust") {
+			const normalized = normalizeCommand(command);
+			repeatCommand = normalized !== "" && guardedCommands.has(normalized);
+			if (normalized !== "") {
+				if (guardedCommands.size >= MAX_TRACKED_COMMANDS) guardedCommands.clear();
+				guardedCommands.add(normalized);
+			}
+			exhaustHits++;
 		}
 		hitCount++;
 		updateStatus(ctx);
@@ -241,11 +257,12 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 			text,
 			assessment,
 			command,
+			commandClass,
 			fullPath,
 			builtinTruncated,
 			isError: event.isError,
 			cfg,
-			hitCount,
+			escalationCount: exhaustHits,
 			repeatCommand,
 		});
 
@@ -255,7 +272,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	// ── /bash-guard 配置命令 ───────────────────────────────────────
 	pi.registerCommand("bash-guard", {
 		description:
-			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | bytes <n> | preview <head> [tail])",
+			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | bytes <n> | payload <n> | preview <head> [tail])",
 		handler: async (args, ctx) => {
 			const result = parseCommandArgs(args, cfg);
 			if (result.kind === "error") {
@@ -264,7 +281,8 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 			}
 			if (result.kind === "status") {
 				ctx.ui.notify(
-					`bash-guard: ${cfg.enabled ? "on" : "off"}; limit ${describeLimit(cfg)}; scan-block ${cfg.scanBlock ? "on" : "off"}; ` +
+					`bash-guard: ${cfg.enabled ? "on" : "off"}; exhaust limit ${describeLimit({ maxBytes: cfg.maxBytes })}; ` +
+						`payload ${describeLimit({ maxBytes: cfg.payloadMaxBytes })}; scan-block ${cfg.scanBlock ? "on" : "off"}; ` +
 						`preview head ${cfg.previewHead} / tail ${cfg.previewTail} (errors ${cfg.errorPreviewTail}); hits ${hitCount}`,
 					"info",
 				);
@@ -273,7 +291,12 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 			cfg = result.config;
 			persistConfig();
 			updateStatus(ctx);
-			ctx.ui.notify(cfg.enabled ? `bash-guard on: limit ${describeLimit(cfg)}` : "bash-guard off", "info");
+			ctx.ui.notify(
+				cfg.enabled
+					? `bash-guard on: exhaust ${describeLimit({ maxBytes: cfg.maxBytes })} / payload ${describeLimit({ maxBytes: cfg.payloadMaxBytes })}`
+					: "bash-guard off",
+				"info",
+			);
 		},
 	});
 

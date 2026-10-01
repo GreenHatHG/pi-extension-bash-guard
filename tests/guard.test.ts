@@ -81,7 +81,7 @@ describe("tool_result 拦截", () => {
 	test("连续重复行被折叠为 (×N)", async () => {
 		const rt = await setup();
 		const text = Array.from({ length: 300 }, () => `same line ${"y".repeat(40)}`).join("\n");
-		const result = await rt.runToolResult({ text, command: "cat spam.log" });
+		const result = await rt.runToolResult({ text, command: "rg same ." });
 		expect(resultText(result)).toContain("(×");
 	});
 
@@ -91,7 +91,7 @@ describe("tool_result 拦截", () => {
 			...Array.from({ length: 200 }, (_, i) => `line ${i} ${"x".repeat(40)}`),
 			"Error: boom at the end",
 		].join("\n");
-		const result = await rt.runToolResult({ text: body, command: "cat big.log", isError: true });
+		const result = await rt.runToolResult({ text: body, command: "rg line .", isError: true });
 		const text = resultText(result);
 		expect(text).toContain("Command failed (non-zero exit)");
 		expect(text).toContain("Error: boom at the end");
@@ -119,16 +119,83 @@ describe("tool_result 拦截", () => {
 
 	test("第 3 次拦截出现升级警告", async () => {
 		const rt = await setup();
-		await rt.runToolResult({ text: bigOutput(200), command: "cmd one" });
-		await rt.runToolResult({ text: bigOutput(200), command: "cmd two" });
-		const third = await rt.runToolResult({ text: bigOutput(200), command: "cmd three" });
+		await rt.runToolResult({ text: bigOutput(200), command: "rg a ." });
+		await rt.runToolResult({ text: bigOutput(200), command: "rg b ." });
+		const third = await rt.runToolResult({ text: bigOutput(200), command: "rg c ." });
 		expect(resultText(third)).toContain("fired 3 times this session");
 	});
 
 	test("命中的状态栏显示计数", async () => {
 		const rt = await setup();
-		await rt.runToolResult({ text: bigOutput(200), command: "cmd" });
+		await rt.runToolResult({ text: bigOutput(200), command: "rg x ." });
 		expect(rt.statusBars.get("bash-guard")).toContain("×1");
+	});
+});
+
+describe("高价值载荷类的放宽行为", () => {
+	test("cat 输出超过 8KB 但未超 30KB 时原样放行", async () => {
+		const rt = await setup();
+		const text = bigOutput(300); // 约 15KB，介于紧阈值 8KB 与宽阈值 30KB 之间
+		const result = await rt.runToolResult({ text, command: "cat big.log" });
+		expect(result).toBeUndefined();
+	});
+
+	test("cat 输出超过 30KB 时落盘，且不说教、不建议重写", async () => {
+		const rt = await setup();
+		const result = await rt.runToolResult({ text: bigOutput(800), command: "cat big.log" });
+		const text = resultText(result);
+		expect(text).toContain("[BASH OUTPUT GUARD]");
+		expect(text).toContain("Large result saved to disk");
+		expect(text).toContain("Full output saved to:");
+		expect(text).not.toContain("Rewrite the command instead of repeating it");
+		expect(text).not.toContain("Do NOT re-run");
+	});
+
+	test("构建失败低于载荷阈值时原样放行（错误行直接可见）", async () => {
+		const rt = await setup();
+		const body = [...Array.from({ length: 300 }, (_, i) => `build line ${i} ${"x".repeat(40)}`), "Error: boom"].join(
+			"\n",
+		);
+		const result = await rt.runToolResult({ text: body, command: "pnpm build", isError: true });
+		expect(result).toBeUndefined();
+	});
+
+	test("载荷类不计入升级警告", async () => {
+		const rt = await setup();
+		await rt.runToolResult({ text: bigOutput(800), command: "cat a.log" });
+		await rt.runToolResult({ text: bigOutput(800), command: "cat b.log" });
+		const third = await rt.runToolResult({ text: bigOutput(800), command: "cat c.log" });
+		expect(resultText(third)).not.toContain("fired");
+	});
+
+	test("载荷类重复同一命令不提示『已拦截过』", async () => {
+		const rt = await setup();
+		await rt.runToolResult({ text: bigOutput(800), command: "cat same.log" });
+		const second = await rt.runToolResult({ text: bigOutput(800), command: "cat same.log" });
+		expect(resultText(second)).not.toContain("You already ran this exact command");
+	});
+
+	test("payload 子命令可单独调整宽阈值", async () => {
+		const rt = await setup();
+		await rt.runCommand("bash-guard", "payload 400");
+		const result = await rt.runToolResult({ text: bigOutput(20), command: "cat x.log" });
+		expect(resultText(result)).toContain("[BASH OUTPUT GUARD]");
+	});
+
+	test("bytes 0 只关紧阈值，载荷档仍生效（两档独立）", async () => {
+		const rt = await setup();
+		await rt.runCommand("bash-guard", "bytes 0");
+		const result = await rt.runToolResult({ text: bigOutput(800), command: "cat big.log" });
+		expect(resultText(result)).toContain("[BASH OUTPUT GUARD]");
+	});
+
+	test("payload 0 只关宽阈值，紧阈值仍生效（两档独立）", async () => {
+		const rt = await setup();
+		await rt.runCommand("bash-guard", "payload 0");
+		const payloadResult = await rt.runToolResult({ text: bigOutput(800), command: "cat big.log" });
+		expect(payloadResult).toBeUndefined();
+		const exhaustResult = await rt.runToolResult({ text: bigOutput(200), command: "rg x ." });
+		expect(resultText(exhaustResult)).toContain("[BASH OUTPUT GUARD]");
 	});
 });
 
@@ -315,7 +382,7 @@ describe("/bash-guard 配置命令", () => {
 	test("bytes 调低阈值后更小的输出也被拦截", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "bytes 200");
-		const result = await rt.runToolResult({ text: bigOutput(10), command: "cmd" });
+		const result = await rt.runToolResult({ text: bigOutput(10), command: "rg x ." });
 		expect(resultText(result)).toContain("[BASH OUTPUT GUARD]");
 	});
 

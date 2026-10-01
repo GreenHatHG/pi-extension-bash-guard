@@ -1,9 +1,9 @@
 # pi-extension-bash-guard
 
-pi 插件：拦截 bash/powershell 的「大输出」，只回少量核心行 + 全文落盘路径 + **重写命令的提示**；
+pi 插件：拦截 bash/powershell 的「大输出」，只回少量核心行 + 全文落盘路径 + **按命令类别给出正确写法**；
 在**执行前**拦掉根目录为 `$HOME`、`/` 或系统目录（`/etc` 等）的无界扫描；并给搜索类命令
 （`find`/`grep -r`/`rg`/`du`/`tree`）自动封顶 5 分钟超时；同时在会话开局注入一次输出纪律。
-目标不是把输出截断，而是**逼模型把 shell 写对**。
+目标不是把输出截断，而是**逼模型把 shell 写对**，同时**不把模型真正需要的载荷也拦掉**。
 
 ## 行为
 
@@ -25,8 +25,17 @@ pi 插件：拦截 bash/powershell 的「大输出」，只回少量核心行 + 
 
    真实事故 `grep -rln ... ~/.pi ~/Projects ~/ensoai | grep -v ...` 因无 timeout 跑了 **5148 秒**；
    现在这类命令会被自动压到 5 分钟。
-4. **超阈值硬拦截（硬）**：`tool_result` 阶段检查 bash/powershell 结果；超过阈值（默认
-   **8KB 数据**）就把返回给模型的 content **替换**成：
+4. **超阈值硬拦截（硬）**：`tool_result` 阶段先给命令分类，再按类别用不同阈值：
+
+   - **过程输出**（搜索/列举/转储：`rg`、递归 `grep`、`find`、`ls -R`、`env`、`ps`、`git log`…）
+     用**紧阈值**（默认 **8KB**）：替换成预览 + 全文路径 + **重写建议**，并计入重复/升级警告。
+   - **高价值载荷**（其余命令，含 `cat`/`sed` 这类读文件，以及 `pnpm build`/`pytest` 这类构建测试）
+     用**宽阈值**（默认 **30KB**）：低于阈值**原样放行**，超过才落盘，且**不说教**，只给
+     「全文在哪、用 `read`/`grep` 工具按需取」的指引。
+
+   两个类别都保留：头/尾预览（连续重复行折叠为 `(×N)`）、自动抽取的报错/警告行、全文落盘路径。
+
+   「过程输出」被拦时的样例：
 
 ```
 [BASH OUTPUT GUARD] Output withheld: 1842 lines / 214.3KB (limit 8.0KB).
@@ -41,16 +50,29 @@ Error/warning lines:
   <自动抽取的报错/警告行，最多 15 条>
 
 Full output saved to: /var/folders/.../pi-bash-guard-XXXX/output.txt
-Read it selectively: the `read` tool with offset/limit, or `sed -n 'START,ENDp' <path>`, or `rg <pattern> <path>`.
+Read it selectively: the `read` tool with offset/limit, or the `grep` tool pointed at this file.
 
 Rewrite the command instead of repeating it. Do NOT re-run the same command, and do NOT just pipe it to
 `less`/`more`. Suggestions:
   - Cap the search: `rg -l <pattern>` lists matching files only, `-c` counts per file, or `-m 5` / `--max-count=5` caps matches per file.
 ```
 
+   「高价值载荷」被拦时的样例（没有重写说教）：
+
+```
+[BASH OUTPUT GUARD] Large result saved to disk: 3200 lines / 41.2KB (inline limit 30.0KB).
+...
+Full output saved to: /var/folders/.../pi-bash-guard-XXXX/output.txt
+Read it selectively: the `read` tool with offset/limit, or the `grep` tool pointed at this file.
+
+This looks like the content you asked for, so it was capped at the wider payload limit rather than the
+process-output limit. The full output is in the file above; read only the parts you need, and do not
+re-run the command.
+```
+
 不做的事：**不预判输出大小**（不自动给命令加 `| head`，那会破坏重定向/管道语义），
 也**不覆写安装的 `bash` 工具**（pi 内建已经做 2000 行/50KB 截断并落盘全文，本插件
-在此基础上把阈值收紧并加「重写」指令）。命令级干预只有两处：上面第 2 条的
+在此基础上收紧紧阈值、放宽载荷阈值并加「重写」指令）。命令级干预只有两处：上面第 2 条的
 `$HOME`/`/`/系统目录扫描**事前 block**；以及第 3 条的**搜索命令封顶 5 分钟**（非搜索命令不碰）。
 
 ## 亮点
@@ -58,7 +80,8 @@ Rewrite the command instead of repeating it. Do NOT re-run the same command, and
 - **针对性建议**：按原命令特征给具体改写（`cat` → `read`/`sed`；无界 `rg` → `-l`/`-c`/`-m`；
   `git log` → `--oneline -n 20`；`find`/`ls -R`/`du -a`/`env`/`docker logs`……）。
 - **错误不埋**：`isError` 时尾部预览加长，并先抽取 `Error`/`Traceback`/`npm ERR!` 等信号行顶到前面。
-- **重复踩坑升级**：同一命令再次被拦截会提示「已拦截过」；本会话第 3 次起追加升级警告。
+- **重复踩坑升级（只对过程输出）**：过程输出类同一命令再次被拦截会提示「已拦截过」；本会话该类第 3 次起追加升级警告。高价值载荷被反复读取是合理的，不计入。
+- **按类别分档**：先把命令归为「过程输出 / 构建测试 / 其余载荷」（保守白名单，判定不了就当载荷），再用 8KB / 30KB 两档阈值，避免把模型真正需要的内容也逼去「落盘 + 分段读」。
 - **搜索有界、其余放手**：只给搜索类命令自动封顶 5 分钟，且尊重模型更小的显式预算；
   非搜索命令完全不碰，既不误伤长构建，也堵住「递归搜索跑几十分钟无人察觉」的洞。
 - **全文可回查**：优先复用内建 bash 截断时落盘的**完整**输出；否则把当前文本写到本插件临时文件，
@@ -91,7 +114,8 @@ cp -r src ~/.pi/agent/extensions/bash-guard/
 | `/bash-guard on` / `off` | 显式开关 |
 | `/bash-guard status` | 显示当前阈值、预览行数、扫描拦截开关、本会话拦截次数 |
 | `/bash-guard scan on` / `off` | 单独开关「`$HOME`/`/`/系统目录的扫描事前拦截」 |
-| `/bash-guard bytes 8192` | 改字节阈值（`0` = 不限字节） |
+| `/bash-guard bytes 8192` | 改过程输出的字节阈值（`0` = 该档不限；总开关用 `on`/`off`） |
+| `/bash-guard payload 30720` | 改高价值载荷的字节阈值（`0` = 该档不限） |
 | `/bash-guard preview 25 15` | 改头/尾预览行数 |
 
 配置通过 `pi.appendEntry` 持久化进会话，resume 时重放。
@@ -103,7 +127,8 @@ cp -r src ~/.pi/agent/extensions/bash-guard/
 | `PI_BASH_GUARD_DISABLED` | — | 设为非空非 0 值即默认关闭 |
 | `PI_BASH_GUARD_ENABLED=0` | — | 默认关闭 |
 | `PI_BASH_GUARD_SCAN_BLOCK=0` | — | 默认开启；设为 `0`/`false`/`off`/`no` 关闭扫描事前拦截 |
-| `PI_BASH_GUARD_MAX_BYTES` | `8192` | 字节阈值，0 = 不限制字节 |
+| `PI_BASH_GUARD_MAX_BYTES` | `8192` | 过程输出的字节阈值，0 = 该档不限制字节（两档独立） |
+| `PI_BASH_GUARD_PAYLOAD_MAX_BYTES` | `30720` | 高价值载荷的字节阈值，0 = 该档不限制 |
 | `PI_BASH_GUARD_PREVIEW_HEAD` | `20` | 头部预览行数 |
 | `PI_BASH_GUARD_PREVIEW_TAIL` | `15` | 尾部预览行数（成功时） |
 | `PI_BASH_GUARD_ERROR_TAIL` | `25` | 尾部预览行数（失败时） |
@@ -112,6 +137,9 @@ cp -r src ~/.pi/agent/extensions/bash-guard/
 
 ## 设计取舍
 
+- **为什么分两档阈值**：一个全局阈值会把「过程噪声」和「高价值载荷」焊在一起——后者一旦被拦，
+  就逼模型走「落盘 + 分段读」，反而更贵、也更容易漏读。命令分类只做保守白名单，判定不了就按载荷放行，
+  误差方向是「多给内容」而不是「吞内容」。
 - **为什么用 `tool_result` 而不是 `tool_call`**：只有拿到输出才知道大不大；在 `tool_call`
   盲加 `| head` 会破坏重定向、改变退出码语义，还可能把错误截掉。
 - **只限字节、不限行数**：上下文成本≈字节数（~4 字符/token），行数与 token 不直接相关；
@@ -141,6 +169,7 @@ pnpm check:biome # lint + format 检查
 src/index.ts          插件装配：事件、/bash-guard 命令、状态栏、临时文件生命周期
 src/config.ts         阈值默认值、env 初值、命令参数解析、会话持久化重放
 src/analyze.ts        尺寸评估、内建 footer 剔除、预览裁剪、重复行折叠、信号行抽取
+src/classify.ts       命令归类：过程输出 / 构建测试 / 高价值载荷（保守白名单，词汇表参考 claude-code）
 src/suggest.ts        命令启发式 -> 重写建议
 src/scan-guard.ts     扫描解析：引号感知段切分 + tokenizer + find/grep/rg/du/tree root 判定
 src/timeout-guard.ts  搜索命令 5 分钟超时封顶（纯函数）

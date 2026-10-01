@@ -13,8 +13,14 @@ export interface GuardConfig {
 	enabled: boolean;
 	/** 事前扫描拦截：根目录为 `$HOME`、`/` 或系统目录（`/etc` 等）的 find/grep/rg 直接 block。 */
 	scanBlock: boolean;
-	/** 字节阈值（超过即拦截）。0 = 不限制字节数。 */
+	/** 过程输出（搜索/列举/转储）的字节阈值。0 = 该档不限制字节；总开关是 `enabled`。 */
 	maxBytes: number;
+	/**
+	 * 高价值载荷类命令（非搜索/列举类）的字节阈值。0 = 该档不限制。
+	 * 搜索/列举类用 `maxBytes`，其余用这个更宽的值，避免把模型真正需要的内容
+	 * 也逼去「落盘 + 分段读」。两档相互独立。
+	 */
+	payloadMaxBytes: number;
 	/** 预览保留的头部行数。 */
 	previewHead: number;
 	/** 预览保留的尾部行数。 */
@@ -27,6 +33,7 @@ export const DEFAULT_CONFIG: GuardConfig = {
 	enabled: true,
 	scanBlock: true,
 	maxBytes: 8 * 1024,
+	payloadMaxBytes: 30 * 1024,
 	previewHead: 20,
 	previewTail: 15,
 	errorPreviewTail: 25,
@@ -71,6 +78,7 @@ export function loadEnvConfig(env: NodeJS.ProcessEnv = process.env): GuardConfig
 	}
 
 	cfg.maxBytes = nonNegativeInt(env.PI_BASH_GUARD_MAX_BYTES, cfg.maxBytes);
+	cfg.payloadMaxBytes = nonNegativeInt(env.PI_BASH_GUARD_PAYLOAD_MAX_BYTES, cfg.payloadMaxBytes);
 	cfg.previewHead = positiveInt(env.PI_BASH_GUARD_PREVIEW_HEAD, cfg.previewHead);
 	cfg.previewTail = positiveInt(env.PI_BASH_GUARD_PREVIEW_TAIL, cfg.previewTail);
 	cfg.errorPreviewTail = positiveInt(env.PI_BASH_GUARD_ERROR_TAIL, cfg.errorPreviewTail);
@@ -127,6 +135,16 @@ export function parseCommandArgs(args: string, current: GuardConfig): CommandPar
 			}
 			return { kind: "config", config: { ...current, maxBytes: n } };
 		}
+		case "payload": {
+			const n = Number.parseInt(rest[0] ?? "", 10);
+			if (!Number.isFinite(n) || n < 0) {
+				return {
+					kind: "error",
+					message: `payload expects a non-negative integer (0 = unlimited), got: ${rest[0] ?? "(nothing)"}`,
+				};
+			}
+			return { kind: "config", config: { ...current, payloadMaxBytes: n } };
+		}
 		case "preview": {
 			const head = Number.parseInt(rest[0] ?? "", 10);
 			if (!Number.isFinite(head) || head < 0) {
@@ -141,7 +159,7 @@ export function parseCommandArgs(args: string, current: GuardConfig): CommandPar
 		default:
 			return {
 				kind: "error",
-				message: `Unknown /bash-guard argument: ${cmd}. Use: on | off | status | scan <on|off> | bytes <n> | preview <head> [tail]`,
+				message: `Unknown /bash-guard argument: ${cmd}. Use: on | off | status | scan <on|off> | bytes <n> | payload <n> | preview <head> [tail]`,
 			};
 	}
 }

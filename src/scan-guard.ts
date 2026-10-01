@@ -153,7 +153,7 @@ export interface ParsedScan {
 }
 
 /** 取路径的 basename，用于识别 `/usr/bin/grep` 这类绝对路径调用。 */
-function basename(token: string): string {
+export function basename(token: string): string {
 	const idx = token.lastIndexOf("/");
 	return idx >= 0 ? token.slice(idx + 1) : token;
 }
