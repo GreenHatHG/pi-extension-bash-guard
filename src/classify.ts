@@ -132,6 +132,32 @@ const BUILD_COMMANDS = new Set([
 /** 单个命令段（已剥掉包装器与重定向）的类别。 */
 type SegmentKind = "search" | "read" | "build" | "other";
 
+/** git 全局选项中需要独立消费一个值的选项。 */
+const GIT_GLOBAL_VALUE_FLAGS = new Set([
+	"-C",
+	"-c",
+	"--config-env",
+	"--exec-path",
+	"--git-dir",
+	"--namespace",
+	"--super-prefix",
+	"--work-tree",
+]);
+
+/** 找到 git 全局选项之后的真实子命令。 */
+function gitSubcommand(tokens: string[]): string | undefined {
+	for (let i = 1; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (token === "--") return tokens[i + 1];
+		if (token.startsWith("-")) {
+			if (!token.includes("=") && GIT_GLOBAL_VALUE_FLAGS.has(token)) i++;
+			continue;
+		}
+		return token;
+	}
+	return undefined;
+}
+
 /** 判断一个命令段属于哪一类；白名单之外一律 `other`。 */
 function segmentKind(tokens: string[]): SegmentKind {
 	const base = basename(tokens[0] ?? "");
@@ -139,7 +165,7 @@ function segmentKind(tokens: string[]): SegmentKind {
 	if (READ_COMMANDS.has(base)) return "read";
 	if (BUILD_COMMANDS.has(base)) return "build";
 	// `git log` 无界时是典型过程噪声；`git diff` / `git status` 的输出更可能是载荷。
-	if (base === "git" && tokens[1] === "log") return "search";
+	if (base === "git" && gitSubcommand(tokens) === "log") return "search";
 	return "other";
 }
 

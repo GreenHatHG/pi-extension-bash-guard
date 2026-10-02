@@ -15,6 +15,8 @@ describe("suggestRewrites", () => {
 	test("git log 无界 -> 建议 --oneline -n", () => {
 		const hints = suggestRewrites("git log");
 		expect(hints.join(" ")).toContain("--oneline");
+		expect(suggestRewrites("git --no-pager log").join(" ")).toContain("--oneline");
+		expect(suggestRewrites("git -C /tmp log").join(" ")).toContain("--oneline");
 	});
 
 	test("git diff -> 建议 --stat", () => {

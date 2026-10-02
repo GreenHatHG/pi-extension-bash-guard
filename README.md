@@ -11,7 +11,7 @@ pi 插件：拦截 bash/powershell 的「大输出」，只回少量核心行 + 
 
 1. **开局立规矩（软）**：会话第一次 agent run 时注入一条 `[BASH OUTPUT DISCIPLINE]`
    （`display: false`，只进模型上下文不进 TUI），告诉模型搜索/读文件/日志该怎么限量，
-   以及被 guard 拦截后该怎么办。只注入一次，append-only，缓存安全。
+   以及被 guard 拦截后该怎么办。普通会话只注入一次；compaction 后会在下一次 agent run 重新注入。
 2. **事前拦截无界扫描（硬）**：`tool_call` 阶段检测 `find`/`grep -r`/`rg`/`du`/`tree` 的扫描根目录；
    若为 `$HOME`（含 `~`、`$HOME`、`${HOME}`、字面 home 路径）、`/`、或精确的系统目录
    （`/etc`、`/var`、`/usr`、`/System`、`/Library`、`/Applications`、`/opt`、`/private`、`/bin`、`/sbin`、`/dev`、`/proc`），
@@ -49,7 +49,7 @@ Preview — last 15 lines:
 Error/warning lines:
   <自动抽取的报错/警告行，最多 15 条>
 
-Full output saved to: /var/folders/.../pi-bash-guard-XXXX/output.txt
+Full output saved to: /var/folders/.../pi-bash-guard-XXXX/output-0.txt
 Read it selectively: the `read` tool with offset/limit, or the `grep` tool pointed at this file.
 
 Rewrite the command instead of repeating it. Do NOT re-run the same command, and do NOT just pipe it to
@@ -62,7 +62,7 @@ Rewrite the command instead of repeating it. Do NOT re-run the same command, and
 ```
 [BASH OUTPUT GUARD] Large result saved to disk: 3200 lines / 41.2KB (inline limit 30.0KB).
 ...
-Full output saved to: /var/folders/.../pi-bash-guard-XXXX/output.txt
+Full output saved to: /var/folders/.../pi-bash-guard-XXXX/output-0.txt
 Read it selectively: the `read` tool with offset/limit, or the `grep` tool pointed at this file.
 
 This looks like the content you asked for, so it was capped at the wider payload limit rather than the
@@ -103,6 +103,10 @@ cp -r src ~/.pi/agent/extensions/bash-guard/
 ```
 
 装完 `/reload` 热加载；`pi list` 查看已装包，`pi remove ...` 卸载。
+
+## 平台限制
+
+`powershell` 工具也会经过字节输出 guard 和可识别搜索命令的 timeout 上限；但扫描 root 解析器主要按 POSIX shell 语法实现，尚不是完整的 PowerShell parser。Windows 路径、PowerShell 原生命令（如 `Get-ChildItem -Recurse`）、反引号转义等情况可能漏掉事前扫描拦截。需要严格扫描保护时，请使用 bash/`rg` 等可被解析的命令，或关闭/调整对应策略前先人工确认。
 
 ## 配置
 

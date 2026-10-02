@@ -110,6 +110,20 @@ describe("tool_result 拦截", () => {
 		expect(text).toContain("built-in output cap was already hit");
 	});
 
+	test("内建截断的真实总量来自 truncation details，而不是截断文本", async () => {
+		const rt = await setup();
+		const result = await rt.runToolResult({
+			text: "only the retained tail",
+			command: "rg foo .",
+			details: {
+				truncation: { truncated: true, totalLines: 10241, totalBytes: 3_200_000 },
+				fullOutputPath: "/tmp/builtin/full.txt",
+			},
+		});
+		const text = resultText(result);
+		expect(text).toContain("Output withheld: 10241 lines / 3.1MB");
+	});
+
 	test("同一命令重复触发时提示已拦截过", async () => {
 		const rt = await setup();
 		await rt.runToolResult({ text: bigOutput(200), command: "rg x ." });
@@ -117,12 +131,21 @@ describe("tool_result 拦截", () => {
 		expect(resultText(second)).toContain("You already ran this exact command");
 	});
 
-	test("第 3 次拦截出现升级警告", async () => {
+	test("第 3 次拦截出现升级警告，之后只出现一次", async () => {
 		const rt = await setup();
 		await rt.runToolResult({ text: bigOutput(200), command: "rg a ." });
 		await rt.runToolResult({ text: bigOutput(200), command: "rg b ." });
 		const third = await rt.runToolResult({ text: bigOutput(200), command: "rg c ." });
+		const fourth = await rt.runToolResult({ text: bigOutput(200), command: "rg d ." });
 		expect(resultText(third)).toContain("fired 3 times this session");
+		expect(resultText(fourth)).not.toContain("fired 4 times this session");
+	});
+
+	test("CJK guard 消息按 UTF-8 字节预算截断", async () => {
+		const rt = await setup();
+		const text = Array.from({ length: 40 }, (_, i) => `错误 ${i} ${"中文".repeat(250)}`).join("\n");
+		const result = await rt.runToolResult({ text, command: "rg error ." });
+		expect(Buffer.byteLength(resultText(result), "utf8")).toBeLessThanOrEqual(8 * 1024);
 	});
 
 	test("命中的状态栏显示计数", async () => {

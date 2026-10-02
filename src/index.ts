@@ -62,7 +62,7 @@ export function buildDisciplineText(cfg: GuardConfig): string {
 		`An extension guards shell output. Search/listing/dump commands (e.g. \`rg\`, recursive \`grep\`, \`find\`, \`ls -R\`, ` +
 			`\`env\`, \`ps\`, \`git log\`) are capped at ${exhaustLimit}; other commands are capped at ${payloadLimit}. ` +
 			"Above the cap, the result is replaced with a short preview, the error/warning lines, and a path to the full output. " +
-			"Treat it as a nudge to rewrite the command, or to read the file, not as a failure.",
+			"Guarded results are marked `[BASH OUTPUT GUARD]`. Treat it as a nudge to rewrite the command, or to read the file, not as a failure.",
 		"",
 		"Bound output before you run:",
 		"- Content search: use the `grep` tool (`limit` caps matches; it respects .gitignore). In bash, `rg -l` lists matching files only, `-c` counts per file, `-m 5` caps matches per file. Never scan a huge tree unbounded.",
@@ -71,19 +71,24 @@ export function buildDisciplineText(cfg: GuardConfig): string {
 		"- Aggregate first: `| wc -l`, `| sort | uniq -c`, `-q`/`--quiet`/`-s`. Write big output to a file, then read/grep it selectively.",
 		"",
 		timeoutLine,
-		"",
-		"When a result starts with `[BASH OUTPUT GUARD]`: if it says output was withheld, rewrite the command with tighter filters. " +
-			"If it says a large result was saved to disk, read the parts you need from that file with the `read` tool (offset/limit) or the `grep` tool. " +
-			"Do NOT re-run the same command and do NOT pipe it to `less`/`more`.",
-		"",
-		"Unbounded scans rooted at `$HOME`, `/`, or a system directory like `/etc` are blocked before they run. Scope to a project directory " +
-			"(`rg -l <pattern> ~/Projects`) or use `mdfind -name '<name>'`; add `-g '!Library/**'` if you must search all of `~`.",
 	].join("\n");
 }
 
+interface OutputTruncation {
+	truncated?: boolean;
+	totalLines?: number;
+	totalBytes?: number;
+}
+
 interface OutputDetails {
-	truncation?: unknown;
+	truncation?: OutputTruncation;
 	fullOutputPath?: string;
+}
+
+interface TempStorage {
+	dir?: string;
+	dirPromise?: Promise<string>;
+	nextFile: number;
 }
 
 /** 复用内建截断时落盘的完整输出；否则把当前文本写到本插件自己的临时文件。 */
@@ -92,12 +97,21 @@ async function resolveFullOutputPath(
 	details: OutputDetails | undefined,
 	builtinTruncated: boolean,
 	tempDirs: Set<string>,
+	storage: TempStorage,
 ): Promise<string> {
 	if (builtinTruncated && details?.fullOutputPath) return details.fullOutputPath;
 	try {
-		const dir = await mkdtemp(join(tmpdir(), "pi-bash-guard-"));
-		tempDirs.add(dir);
-		const file = join(dir, "output.txt");
+		if (!storage.dir) {
+			if (!storage.dirPromise) {
+				storage.dirPromise = mkdtemp(join(tmpdir(), "pi-bash-guard-")).then((dir) => {
+					storage.dir = dir;
+					tempDirs.add(dir);
+					return dir;
+				});
+			}
+			await storage.dirPromise;
+		}
+		const file = join(storage.dir as string, `output-${storage.nextFile++}.txt`);
 		await writeFile(file, text, "utf8");
 		return file;
 	} catch {
@@ -110,8 +124,10 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	let hitCount = 0;
 	let exhaustHits = 0;
 	let framingDelivered = false;
+	let escalationWarningDelivered = false;
 	const guardedCommands = new Set<string>();
 	const tempDirs = new Set<string>();
+	const tempStorage: TempStorage = { nextFile: 0 };
 
 	function persistConfig(): void {
 		try {
@@ -139,6 +155,10 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		hitCount = 0;
 		exhaustHits = 0;
 		framingDelivered = false;
+		escalationWarningDelivered = false;
+		tempStorage.dir = undefined;
+		tempStorage.dirPromise = undefined;
+		tempStorage.nextFile = 0;
 		guardedCommands.clear();
 		const branch = ctx.sessionManager?.getBranch?.() ?? [];
 		const persisted = readPersistedConfig(branch);
@@ -169,6 +189,11 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 				display: false,
 			},
 		};
+	});
+
+	// Compaction 可能裁掉早先注入的 custom message；下一次 agent run 时重新注入。
+	pi.on("session_compact", () => {
+		framingDelivered = false;
 	});
 
 	// ── 事前拦截：根目录为 $HOME、/ 或系统目录的无界扫描 ───────────
@@ -223,7 +248,19 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		// 过程输出用紧阈值（maxBytes），其余按高价值载荷用宽阈值（payloadMaxBytes）。
 		// 两档各自独立：任一为 0 表示该档不限制字节；总开关是 `cfg.enabled`。
 		const effectiveLimit = commandClass === "exhaust" ? cfg.maxBytes : cfg.payloadMaxBytes;
-		const assessment = assessOutput(text, { maxBytes: effectiveLimit });
+		const details = event.details as OutputDetails | undefined;
+		const truncation = details?.truncation;
+		const builtinTruncated = truncation?.truncated === true;
+		const measuredAssessment = assessOutput(text, { maxBytes: effectiveLimit });
+		const assessment =
+			builtinTruncated && typeof truncation.totalLines === "number" && typeof truncation.totalBytes === "number"
+				? {
+						...measuredAssessment,
+						exceeded: effectiveLimit > 0 && truncation.totalBytes > effectiveLimit,
+						totalLines: truncation.totalLines,
+						totalBytes: truncation.totalBytes,
+					}
+				: measuredAssessment;
 		if (!assessment.exceeded) {
 			// 超时错误通常输出很小，阈值拦不到。只有搜索命令会被本插件静默封顶到 300s，
 			// 模型看不到这次改写，才有必要补一句引导；其他命令的超时来自模型/用户显式
@@ -234,13 +271,11 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		const details = event.details as OutputDetails | undefined;
-		const builtinTruncated = Boolean(details?.truncation);
-
-		const fullPath = await resolveFullOutputPath(text, details, builtinTruncated, tempDirs);
+		const fullPath = await resolveFullOutputPath(text, details, builtinTruncated, tempDirs, tempStorage);
 
 		// 只有「过程输出」参与重复提示与升级警告；高价值载荷被反复读取是合理的。
 		let repeatCommand = false;
+		let showEscalationWarning = false;
 		if (commandClass === "exhaust") {
 			const normalized = normalizeCommand(command);
 			repeatCommand = normalized !== "" && guardedCommands.has(normalized);
@@ -249,6 +284,8 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 				guardedCommands.add(normalized);
 			}
 			exhaustHits++;
+			showEscalationWarning = exhaustHits >= 3 && !escalationWarningDelivered;
+			if (showEscalationWarning) escalationWarningDelivered = true;
 		}
 		hitCount++;
 		updateStatus(ctx);
@@ -263,6 +300,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 			isError: event.isError,
 			cfg,
 			escalationCount: exhaustHits,
+			showEscalationWarning,
 			repeatCommand,
 		});
 

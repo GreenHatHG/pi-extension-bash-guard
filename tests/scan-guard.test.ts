@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { detectBlockedScan, tokenizeSegment } from "../src/scan-guard";
+import { detectBlockedScan, stripRedirections, tokenizeSegment } from "../src/scan-guard";
 
 const HOME = "/Users/tester";
 const opts = { home: HOME };
@@ -71,6 +71,11 @@ describe("detectBlockedScan — 拦截文件系统根 /", () => {
 	test("带重定向与 2>&1", () => {
 		expect(hit("rg foo / 2>&1 | head")).toBe("rg / root");
 	});
+
+	test("命令替换中的 rg 也不能绕过 root block", () => {
+		expect(hit('echo "$(rg foo /)"')).toBe("rg / root");
+		expect(hit("echo `rg foo /`")).toBe("rg / root");
+	});
 });
 
 describe("detectBlockedScan — 拦截整个 home", () => {
@@ -128,6 +133,18 @@ describe("detectBlockedScan — 拦截系统目录", () => {
 		"rg foo /tmp",
 	])("放行：%s", (command) => {
 		expect(hit(command)).toBeNull();
+	});
+});
+
+describe("detectBlockedScan — 选项值与引号", () => {
+	test("du/tree 的选项值不应被当成 root", () => {
+		expect(hit("du --exclude /etc ~/Projects")).toBeNull();
+		expect(hit("tree -I /usr .")).toBeNull();
+	});
+
+	test("引号里的 > 不应被当成重定向", () => {
+		expect(stripRedirections('rg "a>b" /')).toBe('rg "a>b" /');
+		expect(hit('rg "a>b" /')).toBe("rg / root");
 	});
 });
 

@@ -16,6 +16,9 @@ const GENERIC_HINT =
 	"Prefer counting/aggregating first (`| wc -l`, `-q`, `--quiet`, `-s`) and then drill down. " +
 	"If you genuinely need the whole output, redirect it to a file (`> /tmp/out.txt`) and read/grep it selectively.";
 
+const GIT_LOG_COMMAND =
+	/(^|[\s|;&(])git(?:\s+(?:--no-pager|--paginate|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs)|\s+-C\s+\S+|\s+-c\s+\S+|\s+--(?:config-env|exec-path|git-dir|namespace|super-prefix|work-tree)(?:=\S+|\s+\S+))*\s+log\b/;
+
 const RULES: Rule[] = [
 	{
 		// cat / less / more / bat：把大文件整个倒出来
@@ -48,7 +51,7 @@ const RULES: Rule[] = [
 	},
 	{
 		// git log 无 -n / --oneline
-		test: (c) => /(^|[\s|;&(])git\s+log\b/.test(c) && !/(-n\s*\d|--max-count|--oneline|\|\s*head)/.test(c),
+		test: (c) => GIT_LOG_COMMAND.test(c) && !/(-n\s*\d|--max-count|--oneline|\|\s*head)/.test(c),
 		hint: "Use `git log --oneline -n 20` (or `--max-count=20`); add `--stat` only when you need changed files.",
 	},
 	{

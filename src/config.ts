@@ -172,7 +172,7 @@ export function readPersistedConfig(
 		const entry = branch[i];
 		if (entry?.type === "custom" && entry.customType === CONFIG_CUSTOM_TYPE) {
 			const data = entry.data as Partial<GuardConfig> | undefined;
-			if (!data || typeof data !== "object") return undefined;
+			if (!data || typeof data !== "object" || Array.isArray(data)) continue;
 			return { ...DEFAULT_CONFIG, ...data };
 		}
 	}

@@ -114,4 +114,12 @@ describe("readPersistedConfig", () => {
 		expect(cfg?.enabled).toBe(false);
 		expect(cfg?.previewHead).toBe(DEFAULT_CONFIG.previewHead);
 	});
+
+	test("最新坏 config entry 跳过，继续找更旧的有效配置", () => {
+		const branch = [
+			{ type: "custom", customType: "bash-guard-config", data: { maxBytes: 1024 } },
+			{ type: "custom", customType: "bash-guard-config", data: null },
+		];
+		expect(readPersistedConfig(branch)?.maxBytes).toBe(1024);
+	});
 });

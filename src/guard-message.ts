@@ -27,8 +27,24 @@ import { suggestRewrites } from "./suggest";
 const SIGNAL_LINE_LIMIT = 15;
 /** 单行最大字符数，防止把「一行刷屏」的超长行原样带回。 */
 const MAX_LINE_CHARS = 400;
-/** guard 文本的字节上限，兜底防御。 */
+/** guard 文本的最大字节上限；实际预算还会受当前输出档位限制。 */
 const MAX_MESSAGE_BYTES = 12 * 1024;
+
+/** 按 UTF-8 字节截取，避免 UTF-16 slice 切断 surrogate pair。 */
+function truncateUtf8(text: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+
+	let bytes = 0;
+	let end = 0;
+	for (const character of text) {
+		const characterBytes = Buffer.byteLength(character, "utf8");
+		if (bytes + characterBytes > maxBytes) break;
+		bytes += characterBytes;
+		end += character.length;
+	}
+	return text.slice(0, end);
+}
 
 export interface GuardMessageInput {
 	/** 工具返回的原始文本。 */
@@ -46,6 +62,8 @@ export interface GuardMessageInput {
 	cfg: GuardConfig;
 	/** 本会话中「过程输出」类被拦截的累计次数（1-based）；仅该类参与升级警告。 */
 	escalationCount: number;
+	/** 是否应在本条消息中发出一次性升级警告。 */
+	showEscalationWarning?: boolean;
 	/** 归一化后的同一命令之前是否已被拦截过。 */
 	repeatCommand: boolean;
 }
@@ -72,6 +90,7 @@ export function buildGuardMessage(input: GuardMessageInput): string {
 		isError,
 		cfg,
 		escalationCount,
+		showEscalationWarning = false,
 		repeatCommand,
 	} = input;
 
@@ -80,7 +99,13 @@ export function buildGuardMessage(input: GuardMessageInput): string {
 
 	const cleaned = stripBuiltinFooter(text);
 	const preview = buildPreview(cleaned, cfg.previewHead, isError ? cfg.errorPreviewTail : cfg.previewTail);
-	const signalLines = extractSignalLines(cleaned, SIGNAL_LINE_LIMIT);
+	const displayedPreviewLines = preview.headLines.length + preview.tailLines.length;
+	const omittedLines = builtinTruncated
+		? Math.max(preview.omittedLines, assessment.totalLines - displayedPreviewLines)
+		: preview.omittedLines;
+	const previewLineKeys = new Set([...preview.headLines, ...preview.tailLines].map((line) => line.trim()));
+	const allSignalLines = extractSignalLines(cleaned, SIGNAL_LINE_LIMIT);
+	const signalLines = allSignalLines.filter((line) => !previewLineKeys.has(line.trim()));
 
 	const parts: string[] = [];
 
@@ -88,6 +113,11 @@ export function buildGuardMessage(input: GuardMessageInput): string {
 		parts.push(
 			`[BASH OUTPUT GUARD] Output withheld: ${assessment.totalLines} lines / ${formatBytes(assessment.totalBytes)} ` +
 				`(limit ${describeLimit({ maxBytes: effectiveLimit })}).`,
+		);
+	} else if (commandClass === "build-test") {
+		parts.push(
+			`[BASH OUTPUT GUARD] Build/test result saved to disk: ${assessment.totalLines} lines / ` +
+				`${formatBytes(assessment.totalBytes)} (inline limit ${describeLimit({ maxBytes: effectiveLimit })}).`,
 		);
 	} else {
 		parts.push(
@@ -100,21 +130,25 @@ export function buildGuardMessage(input: GuardMessageInput): string {
 		parts.push("Command failed (non-zero exit) — the error tail is preserved below.");
 	}
 
-	const hasTail = preview.tailLines.length > 0 && preview.omittedLines > 0;
+	const hasTail = preview.tailLines.length > 0 && omittedLines > 0;
 	if (hasTail) {
 		parts.push(`Preview — first ${preview.headLines.length} lines:`);
 		parts.push(...renderCollapsed(collapseRepeats(preview.headLines), "  "));
-		parts.push(`  ... [${preview.omittedLines} lines omitted] ...`);
+		parts.push(`  ... [${omittedLines} lines omitted] ...`);
 		parts.push(`Preview — last ${preview.tailLines.length} lines:`);
 		parts.push(...renderCollapsed(collapseRepeats(preview.tailLines), "  "));
 	} else {
 		parts.push("Preview:");
 		parts.push(...renderCollapsed(collapseRepeats(preview.headLines), "  "));
+		if (omittedLines > 0) parts.push(`  ... [${omittedLines} lines omitted] ...`);
 	}
 
 	if (signalLines.length > 0) {
 		parts.push("Error/warning lines:");
 		parts.push(...signalLines.map((line) => `  ${clipLine(line)}`));
+	} else if (allSignalLines.length > 0) {
+		parts.push("Error/warning lines:");
+		parts.push("  (already shown in the preview above)");
 	}
 
 	parts.push(`Full output saved to: ${fullPath}`);
@@ -140,10 +174,16 @@ export function buildGuardMessage(input: GuardMessageInput): string {
 			parts.push("");
 			parts.push("You already ran this exact command and it was guarded. Repeating it will not help.");
 		}
-		if (escalationCount >= 3) {
+		if (showEscalationWarning && escalationCount >= 3) {
 			parts.push("");
 			parts.push(`The guard has now fired ${escalationCount} times this session — stop issuing unbounded commands.`);
 		}
+	} else if (commandClass === "build-test") {
+		parts.push("");
+		parts.push(
+			"This is build/test output, so the wider payload limit was used. The complete result is in the file above; " +
+				"read only the relevant error or test sections instead of re-running the command.",
+		);
 	} else {
 		parts.push("");
 		parts.push(
@@ -154,8 +194,15 @@ export function buildGuardMessage(input: GuardMessageInput): string {
 	}
 
 	let message = parts.join("\n");
-	if (Buffer.byteLength(message, "utf8") > MAX_MESSAGE_BYTES) {
-		message = `${message.slice(0, MAX_MESSAGE_BYTES)}\n… [guard message truncated]`;
+	const messageBudget = effectiveLimit > 0 ? Math.min(MAX_MESSAGE_BYTES, effectiveLimit) : MAX_MESSAGE_BYTES;
+	if (Buffer.byteLength(message, "utf8") > messageBudget) {
+		const marker = "\n… [guard message truncated]";
+		const markerBytes = Buffer.byteLength(marker, "utf8");
+		if (messageBudget <= markerBytes) {
+			message = truncateUtf8(marker, messageBudget);
+		} else {
+			message = `${truncateUtf8(message, messageBudget - markerBytes)}${marker}`;
+		}
 	}
 	return message;
 }

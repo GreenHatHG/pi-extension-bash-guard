@@ -259,9 +259,73 @@ export function tokenizeSegment(segment: string): string[] {
 	return tokens;
 }
 
-/** 去掉重定向（`2>/dev/null`、`> /tmp/out`、`<in`），避免把重定向目标误当成扫描 root。 */
+/**
+ * 去掉重定向（`2>/dev/null`、`> /tmp/out`、`<in`），避免把重定向目标误当成扫描 root。
+ * 只在未加引号的 shell 语法中处理，避免把 `rg "a>b" .` 的模式破坏掉。
+ */
 export function stripRedirections(segment: string): string {
-	return segment.replace(/\d*[<>]{1,2}\s*[^\s;&|]+/g, " ");
+	let out = "";
+	let quote: "'" | '"' | null = null;
+	let i = 0;
+	while (i < segment.length) {
+		const ch = segment[i];
+		if (quote) {
+			out += ch;
+			if (ch === "\\" && quote === '"' && i + 1 < segment.length) {
+				out += segment[i + 1];
+				i += 2;
+				continue;
+			}
+			if (ch === quote) quote = null;
+			i++;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			out += ch;
+			i++;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < segment.length) {
+			out += ch + segment[i + 1];
+			i += 2;
+			continue;
+		}
+
+		let operatorStart = i;
+		while (operatorStart < segment.length && /\d/.test(segment[operatorStart])) operatorStart++;
+		if (operatorStart < segment.length && (segment[operatorStart] === "<" || segment[operatorStart] === ">")) {
+			let afterOperator = operatorStart + 1;
+			if (
+				afterOperator < segment.length &&
+				(segment[afterOperator] === segment[operatorStart] || segment[afterOperator] === "&")
+			) {
+				afterOperator++;
+			}
+			while (afterOperator < segment.length && /\s/.test(segment[afterOperator])) afterOperator++;
+			while (afterOperator < segment.length) {
+				const targetChar = segment[afterOperator];
+				if (targetChar === "'" || targetChar === '"') {
+					const targetQuote = targetChar;
+					afterOperator++;
+					while (afterOperator < segment.length && segment[afterOperator] !== targetQuote) {
+						if (segment[afterOperator] === "\\" && targetQuote === '"') afterOperator++;
+						afterOperator++;
+					}
+					afterOperator++;
+					continue;
+				}
+				if (/\s|[;&|]/.test(targetChar)) break;
+				afterOperator++;
+			}
+			out += " ";
+			i = afterOperator;
+			continue;
+		}
+		out += ch;
+		i++;
+	}
+	return out;
 }
 
 /** 剥掉段首的 `NAME=value` 赋值与 `sudo`/`env`/`xargs` 等包装器。 */
@@ -389,15 +453,146 @@ function rgRoots(args: string[]): { recursive: boolean; roots: string[] } {
 	return { recursive: true, roots: patternProvided ? operands : operands.slice(1) };
 }
 
-/** 非选项 operand（用于 `du`/`tree` 这类简单命令；选项值可能混入，但不会造成误判）。 */
-function plainRoots(args: string[]): string[] {
-	return args.filter((token) => token !== "--" && !token.startsWith("-"));
+/** `du`/`tree` 中需要单独消费一个值的选项；否则其值会被误当成扫描 root。 */
+const DU_VALUE_FLAGS = new Set([
+	"-d",
+	"-t",
+	"-B",
+	"--block-size",
+	"--exclude",
+	"--exclude-from",
+	"--max-depth",
+	"--threshold",
+	"--time-style",
+]);
+const TREE_VALUE_FLAGS = new Set(["-H", "-I", "-L", "-P", "-o", "--ignore", "--level", "--pattern", "--output"]);
+
+/** 非选项 operand（用于 `du`/`tree`），跳过选项及其独立值。 */
+function plainRoots(args: string[], valueFlags: Set<string>): string[] {
+	const roots: string[] = [];
+	let endOfOptions = false;
+	for (let i = 0; i < args.length; i++) {
+		const token = args[i];
+		if (!endOfOptions && token === "--") {
+			endOfOptions = true;
+			continue;
+		}
+		if (!endOfOptions && token.startsWith("--")) {
+			const name = token.split("=")[0];
+			if (!token.includes("=") && valueFlags.has(name)) i++;
+			continue;
+		}
+		if (!endOfOptions && token.startsWith("-") && token.length > 1) {
+			if (valueFlags.has(token)) i++;
+			continue;
+		}
+		roots.push(token);
+	}
+	return roots;
+}
+
+/** 提取 `$()` 与反引号中的嵌套命令，避免 shell command substitution 绕过扫描保护。 */
+function extractNestedCommands(command: string): string[] {
+	const nested: string[] = [];
+	let quote: "'" | '"' | null = null;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (ch === "\\") {
+			i++;
+			continue;
+		}
+		if (quote === "'") {
+			if (ch === "'") quote = null;
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === '"') quote = null;
+			if (ch === "$" && command[i + 1] === "(") {
+				const end = findCommandSubstitutionEnd(command, i + 2);
+				if (end !== -1) {
+					nested.push(command.slice(i + 2, end));
+					i = end;
+				}
+			}
+			continue;
+		}
+		if (ch === "'") {
+			quote = ch;
+			continue;
+		}
+		if (ch === '"') {
+			quote = ch;
+			continue;
+		}
+		if (ch === "`") {
+			let end = i + 1;
+			while (end < command.length) {
+				if (command[end] === "\\") {
+					end += 2;
+					continue;
+				}
+				if (command[end] === "`") break;
+				end++;
+			}
+			if (end < command.length) {
+				nested.push(command.slice(i + 1, end));
+				i = end;
+			}
+			continue;
+		}
+		if (ch === "$" && command[i + 1] === "(") {
+			const end = findCommandSubstitutionEnd(command, i + 2);
+			if (end !== -1) {
+				nested.push(command.slice(i + 2, end));
+				i = end;
+			}
+		}
+	}
+	return nested;
+}
+
+function findCommandSubstitutionEnd(command: string, start: number): number {
+	let depth = 1;
+	let quote: "'" | '"' | null = null;
+	for (let i = start; i < command.length; i++) {
+		const ch = command[i];
+		if (ch === "\\") {
+			i++;
+			continue;
+		}
+		if (quote === "'") {
+			if (ch === "'") quote = null;
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === '"') quote = null;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			continue;
+		}
+		if (ch === "$") {
+			if (command[i + 1] === "(") {
+				depth++;
+				i++;
+			}
+			continue;
+		}
+		if (ch === "(") depth++;
+		if (ch === ")") {
+			depth--;
+			if (depth === 0) return i;
+		}
+	}
+	return -1;
 }
 
 /** 解析命令里所有 `find`/`grep`/`rg`/`du`/`tree` 的扫描 root（按出现顺序）。 */
-export function parseScanCommands(command: string): ParsedScan[] {
+export function parseScanCommands(command: string, depth = 0): ParsedScan[] {
 	const out: ParsedScan[] = [];
-	if (!command) return out;
+	if (!command || depth > 8) return out;
+	for (const nested of extractNestedCommands(command)) out.push(...parseScanCommands(nested, depth + 1));
 	for (const segment of splitSegments(command)) {
 		const tokens = stripWrappers(tokenizeSegment(stripRedirections(segment)));
 		if (tokens.length === 0) continue;
@@ -412,7 +607,8 @@ export function parseScanCommands(command: string): ParsedScan[] {
 			const { roots } = rgRoots(args);
 			out.push({ tool, recursive: true, roots });
 		} else if (tool === "du" || tool === "tree") {
-			out.push({ tool, recursive: true, roots: plainRoots(args) });
+			const valueFlags = tool === "du" ? DU_VALUE_FLAGS : TREE_VALUE_FLAGS;
+			out.push({ tool, recursive: true, roots: plainRoots(args, valueFlags) });
 		}
 	}
 	return out;

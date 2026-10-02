@@ -39,6 +39,8 @@ describe("classifyCommand", () => {
 
 	test("git 子命令区分：log 是 exhaust，diff/status 是载荷", () => {
 		expect(classifyCommand("git log --oneline -n 20")).toBe("exhaust");
+		expect(classifyCommand("git --no-pager log")).toBe("exhaust");
+		expect(classifyCommand("git -C /tmp log")).toBe("exhaust");
 		expect(classifyCommand("git diff")).toBe("unknown");
 		expect(classifyCommand("git status")).toBe("unknown");
 	});
