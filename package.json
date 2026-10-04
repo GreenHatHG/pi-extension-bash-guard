@@ -1,7 +1,7 @@
 {
 	"name": "pi-extension-bash-guard",
 	"version": "0.1.0",
-	"description": "pi 插件：拦截 bash/powershell 的大输出，只回少量核心行 + 重写命令的提示，并在会话开局注入输出纪律。",
+	"description": "pi extension: guards large bash/powershell output, returns only a few key lines plus a rewrite hint, and injects output discipline at session start.",
 	"main": "src/index.ts",
 	"keywords": [
 		"pi-package",

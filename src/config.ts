@@ -1,31 +1,31 @@
 /**
- * 阈值配置：默认值、环境变量初值、`/bash-guard` 参数解析。
+ * Limit config: defaults, env-var seeds, and `/bash-guard` argument parsing.
  *
- * 配置通过 `pi.appendEntry(CONFIG_CUSTOM_TYPE, cfg)` 持久化进会话，resume 时从
- * 活动分支重放；环境变量只在会话里没有任何持久化配置时作为初值。
+ * Config is saved into the session with `pi.appendEntry(CONFIG_CUSTOM_TYPE, cfg)` and replayed from
+ * the active branch on resume; env vars only seed it when the session has no saved config yet.
  */
 
-/** 会话条目 customType，用于持久化配置。 */
+/** Session entry customType used to save config. */
 export const CONFIG_CUSTOM_TYPE = "bash-guard-config";
 
 export interface GuardConfig {
-	/** 总开关。关闭后不注入开局提示、不拦截任何输出。 */
+	/** Master switch. When off, no opening hint and no output interception. */
 	enabled: boolean;
-	/** 事前扫描拦截：根目录为 `$HOME`、`/` 或系统目录（`/etc` 等）的 find/grep/rg 直接 block。 */
+	/** Pre-scan block: find/grep/rg rooted at `$HOME`, `/`, or a system dir (`/etc`, etc.) is blocked outright. */
 	scanBlock: boolean;
-	/** 过程输出（搜索/列举/转储）的字节阈值。0 = 该档不限制字节；总开关是 `enabled`。 */
+	/** Byte limit for process output (search/list/dump). 0 = no limit for this tier. */
 	maxBytes: number;
 	/**
-	 * 高价值载荷类命令（非搜索/列举类）的字节阈值。0 = 该档不限制。
-	 * 搜索/列举类用 `maxBytes`，其余用这个更宽的值，避免把模型真正需要的内容
-	 * 也逼去「落盘 + 分段读」。两档相互独立。
+	 * Byte limit for valuable-payload commands (not search/list). 0 = no limit for this tier.
+	 * Search/list uses `maxBytes`; everything else gets this wider value, so content the model needs
+	 * isn't pushed into "save to disk + read in slices".
 	 */
 	payloadMaxBytes: number;
-	/** 预览保留的头部行数。 */
+	/** Preview lines kept from the head. */
 	previewHead: number;
-	/** 预览保留的尾部行数。 */
+	/** Preview lines kept from the tail. */
 	previewTail: number;
-	/** 命令失败（非零退出）时的尾部预览行数，错误通常在尾部，多给几行。 */
+	/** Tail preview lines when the command fails (non-zero exit) — errors are usually at the end, so show more. */
 	errorPreviewTail: number;
 }
 
@@ -45,7 +45,7 @@ function positiveInt(raw: string | undefined, fallback: number): number {
 	return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-/** 与 positiveInt 相同，但接受 0（0 表示不限制）。 */
+/** Same as positiveInt but allows 0 (0 = no limit). */
 function nonNegativeInt(raw: string | undefined, fallback: number): number {
 	if (raw === undefined) return fallback;
 	const n = Number.parseInt(raw, 10);
@@ -59,9 +59,9 @@ function isFalsey(raw: string | undefined): boolean {
 }
 
 /**
- * 从环境变量构造初值。非法值静默忽略，退回默认值。
- * 支持：PI_BASH_GUARD_DISABLED / PI_BASH_GUARD_ENABLED=0 / PI_BASH_GUARD_SCAN_BLOCK=0 /
- * PI_BASH_GUARD_MAX_BYTES / PREVIEW_HEAD / PREVIEW_TAIL / ERROR_TAIL
+ * Build the starting config from env vars; bad values quietly fall back to defaults.
+ * Reads PI_BASH_GUARD_DISABLED / ENABLED / SCAN_BLOCK / MAX_BYTES / PAYLOAD_MAX_BYTES /
+ * PREVIEW_HEAD / PREVIEW_TAIL / ERROR_TAIL.
  */
 export function loadEnvConfig(env: NodeJS.ProcessEnv = process.env): GuardConfig {
 	const cfg: GuardConfig = { ...DEFAULT_CONFIG };
@@ -86,21 +86,15 @@ export function loadEnvConfig(env: NodeJS.ProcessEnv = process.env): GuardConfig
 	return cfg;
 }
 
-/** `/bash-guard` 参数解析结果。纯数据，不产生副作用。 */
+/** Result of parsing `/bash-guard` arguments. */
 export type CommandParseResult =
 	| { kind: "config"; config: GuardConfig }
 	| { kind: "status" }
 	| { kind: "error"; message: string };
 
 /**
- * 解析 `/bash-guard` 参数。
- *
- * - 空参数：开/关切换
- * - `on` / `off`
- * - `status`
- * - `scan on` / `scan off`
- * - `bytes <n>`（n=0 表示不限制）
- * - `preview <head> [tail]`
+ * Parse `/bash-guard` args: empty toggles on/off; `on`/`off`; `status`; `scan <on|off>`;
+ * `bytes <n>`; `payload <n>`; `preview <head> [tail]` (n = 0 means no limit).
  */
 export function parseCommandArgs(args: string, current: GuardConfig): CommandParseResult {
 	const tokens = args.trim().split(/\s+/).filter(Boolean);
@@ -164,7 +158,7 @@ export function parseCommandArgs(args: string, current: GuardConfig): CommandPar
 	}
 }
 
-/** 从会话分支条目里重放最后一次持久化的配置；没有则返回 undefined。 */
+/** Replay the last saved config from session branch entries, or undefined if there is none. */
 export function readPersistedConfig(
 	branch: Array<{ type?: string; customType?: string; data?: unknown }>,
 ): GuardConfig | undefined {

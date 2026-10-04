@@ -1,15 +1,15 @@
 /**
  * pi-extension-bash-guard
  *
- * 三件事：
- * 1. 会话开局注入一次 `[BASH OUTPUT DISCIPLINE]`，让模型主动写出有界输出。
- * 2. `tool_call` 阶段：拦截根目录为 `$HOME`/`/`/系统目录（`/etc` 等）的 find/grep/rg；
- *    并给搜索类命令注入 5 分钟超时上限（缺 `timeout` 或超过 300 秒都压到 300）。
- * 3. `tool_result` 阶段拦截 bash/powershell 的大输出，替换成
- *    「少量核心行 + 全文落盘路径 + 针对性重写建议」，逼模型重写命令。
+ * Three jobs:
+ * 1. Inject `[BASH OUTPUT DISCIPLINE]` once at session start, so the model writes bounded output up front.
+ * 2. On `tool_call`: block find/grep/rg rooted at `$HOME`, `/`, or a system dir (`/etc`, etc.);
+ *    and cap search commands at a 5-minute timeout (missing `timeout` or over 300s both become 300).
+ * 3. On `tool_result`: intercept large bash/powershell output and swap in "a few key lines + full-file
+ *    path + targeted rewrite hints", nudging the model to rewrite the command.
  *
- * 设计约束（与 plan-mode 一致）：不修改 systemPrompt、不动工具集、不注册 `context`
- * 处理器——content 替换是历史尾部 append-only 的一次性结果，零 prompt-cache 重建。
+ * Design rule (same as plan-mode): don't touch systemPrompt, the tool set, or `context` handlers —
+ * content swaps are append-only edits at the tail of history, so no prompt-cache rebuild.
  */
 
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -23,33 +23,33 @@ import { buildGuardMessage } from "./guard-message";
 import { detectBlockedScan } from "./scan-guard";
 import { isSearchCommand, SEARCH_TIMEOUT_SECONDS, searchTimeoutInjection } from "./timeout-guard";
 
-/** 状态栏 key。 */
+/** Status bar key. */
 const STATUS_KEY = "bash-guard";
-/** 开局纪律消息与配置持久化的 customType。 */
+/** customType for the opening discipline message and config persistence. */
 const FRAMING_CUSTOM_TYPE = "bash-guard-framing";
-/** 被 guard 的工具。 */
+/** Tools the guard watches. */
 const GUARDED_TOOLS = new Set(["bash", "powershell"]);
-/** 已拦截命令集合的上限，超过则清空，避免无限增长。 */
+/** Cap on the intercepted-command set; clear it when full so it can't grow forever. */
 const MAX_TRACKED_COMMANDS = 200;
-/** pi bash 超时错误的标志（如 `Command timed out after 600 seconds`）。 */
+/** Marker for pi's bash timeout error (e.g. `Command timed out after 600 seconds`). */
 const TIMEOUT_SIGNAL = /timed out after \d+ seconds/i;
 /**
- * 命中 timeout 且输出很小（未触发尺寸拦截）时追加的引导。
+ * Hint added when we hit a timeout and output is small (so the size guard never fired).
  *
- * 只对搜索命令使用：只有搜索类命令会被本插件静默封顶到 300s，模型看不到这次改写；
- * 其他命令的超时来自模型/用户显式设置的 `timeout`，pi 的原始报错已足够，无需打扰。
+ * Search commands only: we silently cap those at 300s and the model can't see that edit. Other
+ * timeouts come from a `timeout` the model or user set, and pi's own error is enough.
  */
 const TIMEOUT_HINT =
 	"[BASH TIMEOUT GUARD] Search commands are capped at 300s by bash-guard. Raising the timeout past 300s won't help — the cap is re-applied " +
 	"(a smaller explicit timeout is honored). This scan was killed mid-run, so its results may be incomplete. Narrow it instead: " +
 	"`rg -l <pattern> <dir>` with `-g '!**/node_modules/**'` exclusions (a trailing `| grep -v dir` still reads every file), or use `mdfind -name`.";
 
-/** 归一化命令用于「同一命令重复触发」判定。 */
+/** Normalize a command so "same command again" can be detected. */
 export function normalizeCommand(command: string): string {
 	return command.trim().replace(/\s+/g, " ");
 }
 
-/** 开局注入的输出纪律文案。 */
+/** The output-discipline text injected at session start. */
 export function buildDisciplineText(cfg: GuardConfig): string {
 	const exhaustLimit = describeLimit({ maxBytes: cfg.maxBytes });
 	const payloadLimit = describeLimit({ maxBytes: cfg.payloadMaxBytes });
@@ -91,7 +91,7 @@ interface TempStorage {
 	nextFile: number;
 }
 
-/** 复用内建截断时落盘的完整输出；否则把当前文本写到本插件自己的临时文件。 */
+/** Reuse the built-in truncation file when present; otherwise write the text to our own temp file. */
 async function resolveFullOutputPath(
 	text: string,
 	details: OutputDetails | undefined,
@@ -133,7 +133,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		try {
 			pi.appendEntry(CONFIG_CUSTOM_TYPE, { ...cfg });
 		} catch {
-			// 持久化失败不致命：本进程内配置仍正确，仅 resume 后丢失
+			// Save failure isn't fatal: config is still right in this process, just lost on resume
 		}
 	}
 
@@ -146,11 +146,11 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 			}
 			ctx.ui.setStatus(STATUS_KEY, hitCount > 0 ? `🛡 bash-guard ×${hitCount}` : "🛡 bash-guard");
 		} catch {
-			// print 模式等无 UI 环境：忽略
+			// No-UI setups like print mode: ignore
 		}
 	}
 
-	// ── 会话恢复：重放配置与 framing 闩锁，重置统计 ─────────────────
+	// ── Session restore: replay config and framing latch, reset counters ───────────
 	pi.on("session_start", (_event, ctx) => {
 		hitCount = 0;
 		exhaustHits = 0;
@@ -173,14 +173,14 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		updateStatus(ctx);
 	});
 
-	// ── 开局软提示：只注入一次，缓存安全 ───────────────────────────
+	// ── Opening soft hint: inject once, cache-safe ────────────────────────────────
 	pi.on("before_agent_start", () => {
 		if (!cfg.enabled || framingDelivered) return;
 		framingDelivered = true;
 		try {
 			pi.appendEntry(FRAMING_CUSTOM_TYPE, { delivered: true });
 		} catch {
-			// 忽略：下次 resume 会重新注入一次纪律说明，无害
+			// Ignore: the next resume just re-injects the discipline text, harmless
 		}
 		return {
 			message: {
@@ -191,12 +191,12 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		};
 	});
 
-	// Compaction 可能裁掉早先注入的 custom message；下一次 agent run 时重新注入。
+	// Compaction can drop the earlier custom message; re-inject on the next agent run.
 	pi.on("session_compact", () => {
 		framingDelivered = false;
 	});
 
-	// ── 事前拦截：根目录为 $HOME、/ 或系统目录的无界扫描 ───────────
+	// ── Pre-run block: unbounded scans rooted at $HOME, /, or a system dir ────────
 	pi.on("tool_call", (event, ctx) => {
 		if (!cfg.enabled) return;
 		if (!GUARDED_TOOLS.has(event.toolName)) return;
@@ -210,14 +210,14 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 				try {
 					ctx.ui.notify(`Blocked unbounded scan: ${hit.tool} → ${hit.root}`, "warning");
 				} catch {
-					// 无 UI 环境：忽略
+					// No-UI setup: ignore
 				}
 				return { block: true, reason: hit.reason };
 			}
 		}
 
-		// 搜索命令封顶 5 分钟：pi 的 `tool_call` input 可变，原地改写 `timeout`。
-		// 缺 `timeout` 或超过 300 秒都压到 300；模型给了更小的值则保留。
+		// Cap search commands at 5 minutes: pi's `tool_call` input is mutable, so rewrite `timeout` in place.
+		// Missing `timeout` or over 300s both become 300; a smaller model-set value is kept.
 		const injection = searchTimeoutInjection(command, input ?? {});
 		if (injection !== null && input) {
 			const had = typeof input.timeout === "number" ? input.timeout : undefined;
@@ -226,14 +226,14 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 				try {
 					ctx.ui.notify(`Capped search timeout ${had}s → ${injection}s`, "warning");
 				} catch {
-					// 无 UI 环境：忽略
+					// No-UI setup: ignore
 				}
 			}
 		}
 		return;
 	});
 
-	// ── 超阈值硬拦截 ───────────────────────────────────────────────
+	// ── Hard block when over the limit ────────────────────────────────────────────
 	pi.on("tool_result", async (event, ctx) => {
 		if (!cfg.enabled) return;
 		if (!GUARDED_TOOLS.has(event.toolName)) return;
@@ -245,8 +245,8 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		const command = typeof input?.command === "string" ? input.command : "";
 
 		const commandClass = classifyCommand(command);
-		// 过程输出用紧阈值（maxBytes），其余按高价值载荷用宽阈值（payloadMaxBytes）。
-		// 两档各自独立：任一为 0 表示该档不限制字节；总开关是 `cfg.enabled`。
+		// Process output uses the tight limit (maxBytes); everything else uses the wide payload limit.
+		// Each tier is separate: either 0 means no byte limit for that tier; the master switch is `cfg.enabled`.
 		const effectiveLimit = commandClass === "exhaust" ? cfg.maxBytes : cfg.payloadMaxBytes;
 		const details = event.details as OutputDetails | undefined;
 		const truncation = details?.truncation;
@@ -262,9 +262,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 					}
 				: measuredAssessment;
 		if (!assessment.exceeded) {
-			// 超时错误通常输出很小，阈值拦不到。只有搜索命令会被本插件静默封顶到 300s，
-			// 模型看不到这次改写，才有必要补一句引导；其他命令的超时来自模型/用户显式
-			// 设置的 `timeout`，pi 的原始报错已足够，不打扰。
+			// Timeout errors are usually tiny, so the size limit misses them; only our silently-capped search commands need the hint.
 			if (event.isError && TIMEOUT_SIGNAL.test(text) && isSearchCommand(command)) {
 				return { content: [{ type: "text" as const, text: `${text}\n\n${TIMEOUT_HINT}` }] };
 			}
@@ -273,7 +271,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 
 		const fullPath = await resolveFullOutputPath(text, details, builtinTruncated, tempDirs, tempStorage);
 
-		// 只有「过程输出」参与重复提示与升级警告；高价值载荷被反复读取是合理的。
+		// Only process output gets repeat and escalation warnings; re-reading valuable payload is fine.
 		let repeatCommand = false;
 		let showEscalationWarning = false;
 		if (commandClass === "exhaust") {
@@ -307,7 +305,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		return { content: [{ type: "text" as const, text: guardText }] };
 	});
 
-	// ── /bash-guard 配置命令 ───────────────────────────────────────
+	// ── /bash-guard config command ─────────────────────────────────────────────────
 	pi.registerCommand("bash-guard", {
 		description:
 			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | bytes <n> | payload <n> | preview <head> [tail])",
@@ -338,7 +336,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// ── 清理本插件创建的临时目录 ───────────────────────────────────
+	// ── Clean up temp dirs we created ─────────────────────────────────────────────────
 	pi.on("session_shutdown", async () => {
 		const dirs = [...tempDirs];
 		tempDirs.clear();

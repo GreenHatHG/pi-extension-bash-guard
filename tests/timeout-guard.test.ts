@@ -16,12 +16,12 @@ describe("isSearchCommand", () => {
 		"tree",
 		"sudo find /tmp -name x",
 		'/usr/bin/rg -n "a|b" src',
-	])("搜索命令：%s", (command) => {
+	])("search command: %s", (command) => {
 		expect(isSearchCommand(command)).toBe(true);
 	});
 
 	test.each([
-		"grep foo file.txt", // 非递归 grep
+		"grep foo file.txt", // non-recursive grep
 		"grep -n foo file.txt",
 		"ls",
 		"git status",
@@ -30,29 +30,29 @@ describe("isSearchCommand", () => {
 		"cat file",
 		"pnpm install",
 		"echo rg",
-	])("非搜索命令：%s", (command) => {
+	])("not a search command: %s", (command) => {
 		expect(isSearchCommand(command)).toBe(false);
 	});
 });
 
-describe("searchTimeoutInjection — 搜索命令封顶 5 分钟", () => {
-	test("缺 timeout 的搜索命令注入 300", () => {
+describe("searchTimeoutInjection — caps search commands at 5 minutes", () => {
+	test("Search command with no timeout gets 300", () => {
 		expect(inject("rg foo src")).toBe(SEARCH_TIMEOUT_SECONDS);
 		expect(inject("find . -name x")).toBe(300);
 		expect(inject("grep -r foo .")).toBe(300);
 	});
 
-	test("显式更大的 timeout 压到 300（5 分钟是硬上限）", () => {
+	test("An explicit larger timeout is pulled to 300 (5 minutes is the hard cap)", () => {
 		expect(inject("rg foo src", 900)).toBe(300);
 		expect(inject("find . -name x", SEARCH_TIMEOUT_SECONDS + 1)).toBe(300);
 	});
 
-	test("显式更小的 timeout 保留（300 是上限不是覆盖）", () => {
+	test("An explicit smaller timeout is kept (300 is a ceiling, not an override)", () => {
 		expect(inject("rg foo src", 60)).toBeNull();
 		expect(inject("find . -name x", SEARCH_TIMEOUT_SECONDS)).toBeNull();
 	});
 
-	test("非搜索命令一律不动（全放开）", () => {
+	test("Non-search commands are never touched (hands off)", () => {
 		expect(inject("grep foo file.txt")).toBeNull();
 		expect(inject("git status")).toBeNull();
 		expect(inject("tail -f app.log")).toBeNull();

@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, test, vi } from "vitest";
 import { createMockRuntime, type MockRuntime } from "./helpers/mockPi";
 
 function bigOutput(n = 500, prefix = "line"): string {
-	// 每行约 50 字节，确保默认 8KB 字节阈值被触发（只看字节，不限行数）
+	// ~50 bytes per line, so the default 8KB limit fires (bytes only, no line cap)
 	return Array.from({ length: n }, (_, i) => `${prefix} ${i} ${"x".repeat(40)}`).join("\n");
 }
 
@@ -23,8 +23,8 @@ beforeEach(() => {
 	vi.resetModules();
 });
 
-describe("开局纪律注入", () => {
-	test("首次 agent run 注入 [BASH OUTPUT DISCIPLINE]，且只注入一次", async () => {
+describe("Session-start discipline injection", () => {
+	test("First agent run injects [BASH OUTPUT DISCIPLINE], once only", async () => {
 		const rt = await setup();
 		const first = await rt.startAgent();
 		expect(first?.message?.customType).toBe("bash-guard-framing");
@@ -34,34 +34,34 @@ describe("开局纪律注入", () => {
 		expect(second).toBeUndefined();
 	});
 
-	test("纪律说明持久化进会话条目", async () => {
+	test("Discipline note is saved to a session entry", async () => {
 		const rt = await setup();
 		await rt.startAgent();
 		expect(rt.sessionEntries.some((e) => e.customType === "bash-guard-framing")).toBe(true);
 	});
 });
 
-describe("tool_result 拦截", () => {
-	test("小输出原样放行（不返回改写）", async () => {
+describe("tool_result interception", () => {
+	test("Small output passes through (no rewrite)", async () => {
 		const rt = await setup();
 		const result = await rt.runToolResult({ text: "hello\nworld", command: "echo hi" });
 		expect(result).toBeUndefined();
 	});
 
-	test("只看字节：很多短行但字节没超 8KB 时放行", async () => {
+	test("Bytes only: many short lines under 8KB pass", async () => {
 		const rt = await setup();
 		const manyShortLines = Array.from({ length: 2000 }, () => "a").join("\n");
 		const result = await rt.runToolResult({ text: manyShortLines, command: "seq a" });
 		expect(result).toBeUndefined();
 	});
 
-	test("非 bash/powershell 工具放行", async () => {
+	test("Non bash/powershell tools pass", async () => {
 		const rt = await setup();
 		const result = await rt.runToolResult({ toolName: "read", text: bigOutput(), command: "read" });
 		expect(result).toBeUndefined();
 	});
 
-	test("大输出被替换：含 guard 标题、预览、全文路径与重写建议", async () => {
+	test("Large output is replaced: guard header, preview, full path, rewrite hints", async () => {
 		const rt = await setup();
 		const result = await rt.runToolResult({ text: bigOutput(500), command: 'rg "TODO" .' });
 		const text = resultText(result);
@@ -74,18 +74,18 @@ describe("tool_result 拦截", () => {
 		expect(text).toContain("Rewrite the command instead of repeating it");
 		expect(text).toContain("Do NOT re-run the same command");
 		expect(text).toContain("--max-count");
-		// details 不被改写
+		// details are left untouched
 		expect(result.details).toBeUndefined();
 	});
 
-	test("连续重复行被折叠为 (×N)", async () => {
+	test("Repeated lines fold into (×N)", async () => {
 		const rt = await setup();
 		const text = Array.from({ length: 300 }, () => `same line ${"y".repeat(40)}`).join("\n");
 		const result = await rt.runToolResult({ text, command: "rg same ." });
 		expect(resultText(result)).toContain("(×");
 	});
 
-	test("失败命令保留错误尾部并给出失败提示", async () => {
+	test("Failed command keeps the error tail and notes the failure", async () => {
 		const rt = await setup();
 		const body = [
 			...Array.from({ length: 200 }, (_, i) => `line ${i} ${"x".repeat(40)}`),
@@ -98,7 +98,7 @@ describe("tool_result 拦截", () => {
 		expect(text).toContain("Error/warning lines:");
 	});
 
-	test("内建已截断时复用其完整输出路径并注明", async () => {
+	test("When built-in truncation already hit, reuse its full-output path and say so", async () => {
 		const rt = await setup();
 		const result = await rt.runToolResult({
 			text: bigOutput(500),
@@ -110,7 +110,7 @@ describe("tool_result 拦截", () => {
 		expect(text).toContain("built-in output cap was already hit");
 	});
 
-	test("内建截断的真实总量来自 truncation details，而不是截断文本", async () => {
+	test("Built-in truncation totals come from truncation details, not the truncated text", async () => {
 		const rt = await setup();
 		const result = await rt.runToolResult({
 			text: "only the retained tail",
@@ -124,14 +124,14 @@ describe("tool_result 拦截", () => {
 		expect(text).toContain("Output withheld: 10241 lines / 3.1MB");
 	});
 
-	test("同一命令重复触发时提示已拦截过", async () => {
+	test("Repeating the same command says it was already intercepted", async () => {
 		const rt = await setup();
 		await rt.runToolResult({ text: bigOutput(200), command: "rg x ." });
 		const second = await rt.runToolResult({ text: bigOutput(200), command: "rg x ." });
 		expect(resultText(second)).toContain("You already ran this exact command");
 	});
 
-	test("第 3 次拦截出现升级警告，之后只出现一次", async () => {
+	test("Escalation warning appears on the 3rd interception, then only once", async () => {
 		const rt = await setup();
 		await rt.runToolResult({ text: bigOutput(200), command: "rg a ." });
 		await rt.runToolResult({ text: bigOutput(200), command: "rg b ." });
@@ -141,29 +141,29 @@ describe("tool_result 拦截", () => {
 		expect(resultText(fourth)).not.toContain("fired 4 times this session");
 	});
 
-	test("CJK guard 消息按 UTF-8 字节预算截断", async () => {
+	test("CJK guard message is cut to the UTF-8 byte budget", async () => {
 		const rt = await setup();
 		const text = Array.from({ length: 40 }, (_, i) => `错误 ${i} ${"中文".repeat(250)}`).join("\n");
 		const result = await rt.runToolResult({ text, command: "rg error ." });
 		expect(Buffer.byteLength(resultText(result), "utf8")).toBeLessThanOrEqual(8 * 1024);
 	});
 
-	test("命中的状态栏显示计数", async () => {
+	test("Status bar shows the hit count", async () => {
 		const rt = await setup();
 		await rt.runToolResult({ text: bigOutput(200), command: "rg x ." });
 		expect(rt.statusBars.get("bash-guard")).toContain("×1");
 	});
 });
 
-describe("高价值载荷类的放宽行为", () => {
-	test("cat 输出超过 8KB 但未超 30KB 时原样放行", async () => {
+describe("Wider behavior for valuable payloads", () => {
+	test("cat output over 8KB but under 30KB passes through", async () => {
 		const rt = await setup();
-		const text = bigOutput(300); // 约 15KB，介于紧阈值 8KB 与宽阈值 30KB 之间
+		const text = bigOutput(300); // ~15KB, between the tight 8KB and wide 30KB limits
 		const result = await rt.runToolResult({ text, command: "cat big.log" });
 		expect(result).toBeUndefined();
 	});
 
-	test("cat 输出超过 30KB 时落盘，且不说教、不建议重写", async () => {
+	test("cat output over 30KB is saved to disk, with no lecturing or rewrite hints", async () => {
 		const rt = await setup();
 		const result = await rt.runToolResult({ text: bigOutput(800), command: "cat big.log" });
 		const text = resultText(result);
@@ -174,7 +174,7 @@ describe("高价值载荷类的放宽行为", () => {
 		expect(text).not.toContain("Do NOT re-run");
 	});
 
-	test("构建失败低于载荷阈值时原样放行（错误行直接可见）", async () => {
+	test("Build failure under the payload limit passes (error lines stay visible)", async () => {
 		const rt = await setup();
 		const body = [...Array.from({ length: 300 }, (_, i) => `build line ${i} ${"x".repeat(40)}`), "Error: boom"].join(
 			"\n",
@@ -183,7 +183,7 @@ describe("高价值载荷类的放宽行为", () => {
 		expect(result).toBeUndefined();
 	});
 
-	test("载荷类不计入升级警告", async () => {
+	test("Payload class doesn't count toward escalation", async () => {
 		const rt = await setup();
 		await rt.runToolResult({ text: bigOutput(800), command: "cat a.log" });
 		await rt.runToolResult({ text: bigOutput(800), command: "cat b.log" });
@@ -191,28 +191,28 @@ describe("高价值载荷类的放宽行为", () => {
 		expect(resultText(third)).not.toContain("fired");
 	});
 
-	test("载荷类重复同一命令不提示『已拦截过』", async () => {
+	test("Repeating the same payload command doesn't say 'already intercepted'", async () => {
 		const rt = await setup();
 		await rt.runToolResult({ text: bigOutput(800), command: "cat same.log" });
 		const second = await rt.runToolResult({ text: bigOutput(800), command: "cat same.log" });
 		expect(resultText(second)).not.toContain("You already ran this exact command");
 	});
 
-	test("payload 子命令可单独调整宽阈值", async () => {
+	test("The payload subcommand adjusts the wide limit on its own", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "payload 400");
 		const result = await rt.runToolResult({ text: bigOutput(20), command: "cat x.log" });
 		expect(resultText(result)).toContain("[BASH OUTPUT GUARD]");
 	});
 
-	test("bytes 0 只关紧阈值，载荷档仍生效（两档独立）", async () => {
+	test("bytes 0 turns off only the tight limit; payload tier still works (tiers are independent)", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "bytes 0");
 		const result = await rt.runToolResult({ text: bigOutput(800), command: "cat big.log" });
 		expect(resultText(result)).toContain("[BASH OUTPUT GUARD]");
 	});
 
-	test("payload 0 只关宽阈值，紧阈值仍生效（两档独立）", async () => {
+	test("payload 0 turns off only the wide limit; tight tier still works (tiers are independent)", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "payload 0");
 		const payloadResult = await rt.runToolResult({ text: bigOutput(800), command: "cat big.log" });
@@ -222,14 +222,14 @@ describe("高价值载荷类的放宽行为", () => {
 	});
 });
 
-describe("tool_call 无界扫描事前拦截", () => {
+describe("tool_call pre-run block of unbounded scans", () => {
 	const toolCall = (rt: MockRuntime, command: string, timeout?: number) => {
 		const input: { command: string; timeout?: number } = { command };
 		if (timeout !== undefined) input.timeout = timeout;
 		return rt.emit("tool_call", { toolName: "bash", input });
 	};
 
-	test("根目录为 / 的 rg 被 block，并给出收窄建议", async () => {
+	test("rg rooted at / is blocked, with narrowing hints", async () => {
 		const rt = await setup();
 		const res = await toolCall(rt, "rg foo /");
 		expect(res?.block).toBe(true);
@@ -237,44 +237,44 @@ describe("tool_call 无界扫描事前拦截", () => {
 		expect(res?.reason).toContain("mdfind");
 	});
 
-	test("根目录为 $HOME 的 find 被 block", async () => {
+	test("find rooted at $HOME is blocked", async () => {
 		const rt = await setup();
 		const res = await toolCall(rt, `find ${homedir()} -name x`);
 		expect(res?.block).toBe(true);
 	});
 
-	test("收窄到子目录放行", async () => {
+	test("Narrowing to a subdir passes", async () => {
 		const rt = await setup();
-		// `rg foo ~/Projects` 不是整个 home，scan-guard 不拦；仅注入 5 分钟封顶（不 block）。
+		// `rg foo ~/Projects` isn't the whole home, so scan-guard passes it; only the 5-minute cap is injected (no block).
 		expect(await toolCall(rt, "rg foo ~/Projects")).toBeUndefined();
 	});
 
-	test("根目录为系统目录 /etc 的 rg 被 block", async () => {
+	test("rg rooted at system dir /etc is blocked", async () => {
 		const rt = await setup();
 		const res = await toolCall(rt, "rg foo /etc");
 		expect(res?.block).toBe(true);
 		expect(res?.reason).toContain("/etc");
 	});
 
-	test("非 bash/powershell 工具放行", async () => {
+	test("Non bash/powershell tools pass", async () => {
 		const rt = await setup();
 		expect(await rt.emit("tool_call", { toolName: "read", input: { command: "rg foo /" } })).toBeUndefined();
 	});
 
-	test("scan off 后放行", async () => {
+	test("scan off lets it pass", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "scan off");
-		// scan-guard 关掉后 `rg foo /` 不再 block（只剩 5 分钟封顶，不 block）
+		// with scan-guard off, `rg foo /` is no longer blocked (only the 5-minute cap remains)
 		expect(await toolCall(rt, "rg foo /")).toBeUndefined();
 	});
 
-	test("总开关 off 后放行", async () => {
+	test("master switch off lets it pass", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "off");
 		expect(await toolCall(rt, "rg foo /")).toBeUndefined();
 	});
 
-	test("scan 开关持久化进会话条目", async () => {
+	test("scan switch is saved to a session entry", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "scan off");
 		const entry = rt.sessionEntries.filter((e) => e.customType === "bash-guard-config").at(-1);
@@ -282,7 +282,7 @@ describe("tool_call 无界扫描事前拦截", () => {
 	});
 });
 
-describe("tool_call 搜索命令超时封顶", () => {
+describe("tool_call timeout cap for search commands", () => {
 	const emitCall = async (rt: MockRuntime, command: string, timeout?: number) => {
 		const input: { command: string; timeout?: number } = { command };
 		if (timeout !== undefined) input.timeout = timeout;
@@ -290,33 +290,33 @@ describe("tool_call 搜索命令超时封顶", () => {
 		return { res, input };
 	};
 
-	test("无 timeout 的搜索命令被注入 300 秒且不 block", async () => {
+	test("Search command with no timeout gets 300s, no block", async () => {
 		const rt = await setup();
 		const { res, input } = await emitCall(rt, "rg foo src");
 		expect(res).toBeUndefined();
 		expect(input.timeout).toBe(300);
 	});
 
-	test("显式大于 300 的搜索命令压到 300", async () => {
+	test("Search command over 300 is pulled to 300", async () => {
 		const rt = await setup();
 		const { input } = await emitCall(rt, 'rg -n "x" src tests | head -30', 900);
 		expect(input.timeout).toBe(300);
 	});
 
-	test("显式小于 300 的搜索命令保留原值（300 是上限不是覆盖）", async () => {
+	test("Search command under 300 keeps its value (300 is a ceiling, not an override)", async () => {
 		const rt = await setup();
 		const { input } = await emitCall(rt, "rg foo src", 60);
 		expect(input.timeout).toBe(60);
 	});
 
-	test("非搜索命令完全不动（不注入 timeout）", async () => {
+	test("Non-search commands are untouched (no timeout injected)", async () => {
 		const rt = await setup();
 		const { res, input } = await emitCall(rt, "git status");
 		expect(res).toBeUndefined();
 		expect(input.timeout).toBeUndefined();
 	});
 
-	test("非搜索命令的 input 对象整体未被改写", async () => {
+	test("Non-search command's input object is left completely alone", async () => {
 		const rt = await setup();
 		const input: { command: string; timeout?: number } = { command: "tail -f app.log" };
 		const before = { ...input };
@@ -325,20 +325,20 @@ describe("tool_call 搜索命令超时封顶", () => {
 		expect(Object.keys(input)).toEqual(["command"]);
 	});
 
-	test("非搜索命令显式的大 timeout 也不动（全放开）", async () => {
+	test("An explicit large timeout on a non-search command is left alone too (hands off)", async () => {
 		const rt = await setup();
 		const { input } = await emitCall(rt, "pnpm install", 999999);
 		expect(input.timeout).toBe(999999);
 	});
 
-	test("scan off 时封顶仍生效（两个开关独立）", async () => {
+	test("Cap still applies when scan is off (the two switches are independent)", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "scan off");
 		const { input } = await emitCall(rt, "rg foo src");
 		expect(input.timeout).toBe(300);
 	});
 
-	test("总开关 off 时完全不动", async () => {
+	test("Master switch off leaves everything alone", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "off");
 		const { res, input } = await emitCall(rt, "rg foo src");
@@ -346,10 +346,10 @@ describe("tool_call 搜索命令超时封顶", () => {
 		expect(input.timeout).toBeUndefined();
 	});
 
-	test("第二个事故命令：递归 grep 无 timeout 被压到 300（不再跑 86 分钟）", async () => {
+	test("Second real-world case: recursive grep with no timeout is pulled to 300 (no more 86-minute runs)", async () => {
 		const rt = await setup();
-		// 根目录为 ~/.pi、~/Projects、~/ensoai —— 非 $HOME/`/`，scan-guard 不 block；
-		// 但它是搜索命令，封顶 5 分钟。
+		// roots are ~/.pi, ~/Projects, ~/ensoai — not $HOME or /, so scan-guard passes it;
+		// but it's a search command, so it gets the 5-minute cap.
 		const command =
 			`grep -rln "@pi_running\\|@pi_win\\|@pi_total" ${homedir()}/.pi ${homedir()}/Projects ${homedir()}/ensoai 2>/dev/null ` +
 			`| grep -v "/sessions/" | grep -v "\\.git/" | head -30`;
@@ -359,8 +359,8 @@ describe("tool_call 搜索命令超时封顶", () => {
 	});
 });
 
-describe("timeout 错误引导", () => {
-	test("搜索命令的超时错误被追加改写引导", async () => {
+describe("Timeout error hint", () => {
+	test("A search command's timeout error gets the rewrite hint", async () => {
 		const rt = await setup();
 		const result = await rt.runToolResult({
 			text: "Command timed out after 600 seconds",
@@ -370,7 +370,7 @@ describe("timeout 错误引导", () => {
 		expect(resultText(result)).toContain("[BASH TIMEOUT GUARD]");
 	});
 
-	test("非搜索命令的超时不被改写（超时非本插件造成）", async () => {
+	test("A non-search command's timeout isn't rewritten (not our cap)", async () => {
 		const rt = await setup();
 		const result = await rt.runToolResult({
 			text: "Command timed out after 600 seconds",
@@ -380,15 +380,15 @@ describe("timeout 错误引导", () => {
 		expect(result).toBeUndefined();
 	});
 
-	test("非超时的普通错误不被改写", async () => {
+	test("A normal, non-timeout error isn't rewritten", async () => {
 		const rt = await setup();
 		const result = await rt.runToolResult({ text: "some small failure", command: "false", isError: true });
 		expect(result).toBeUndefined();
 	});
 });
 
-describe("/bash-guard 配置命令", () => {
-	test("off 后不再拦截，且状态栏清空", async () => {
+describe("/bash-guard config command", () => {
+	test("After off, no more interception and the status bar clears", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "off");
 		expect(rt.statusBars.get("bash-guard")).toBeUndefined();
@@ -396,33 +396,33 @@ describe("/bash-guard 配置命令", () => {
 		expect(result).toBeUndefined();
 	});
 
-	test("off 后也不再注入纪律说明", async () => {
+	test("After off, no discipline note is injected either", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "off");
 		expect(await rt.startAgent()).toBeUndefined();
 	});
 
-	test("bytes 调低阈值后更小的输出也被拦截", async () => {
+	test("After lowering bytes, smaller output is intercepted too", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "bytes 200");
 		const result = await rt.runToolResult({ text: bigOutput(10), command: "rg x ." });
 		expect(resultText(result)).toContain("[BASH OUTPUT GUARD]");
 	});
 
-	test("配置持久化进会话条目", async () => {
+	test("Config is saved to a session entry", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "bytes 2048");
 		const entry = rt.sessionEntries.filter((e) => e.customType === "bash-guard-config").at(-1);
 		expect((entry?.data as any)?.maxBytes).toBe(2048);
 	});
 
-	test("status 报告当前配置", async () => {
+	test("status reports the current config", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "status");
 		expect(rt.notifications.at(-1)?.msg).toContain("bash-guard: on");
 	});
 
-	test("非法参数给出错误通知", async () => {
+	test("Bad arguments produce an error notification", async () => {
 		const rt = await setup();
 		await rt.runCommand("bash-guard", "lines abc");
 		expect(rt.notifications.at(-1)?.kind).toBe("error");

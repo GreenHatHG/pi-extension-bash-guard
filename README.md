@@ -1,53 +1,62 @@
 # pi-extension-bash-guard
 
-pi 插件：拦截 bash/powershell 的「大输出」，只回少量核心行 + 全文落盘路径 + **按命令类别给出正确写法**；
-在**执行前**拦掉根目录为 `$HOME`、`/` 或系统目录（`/etc` 等）的无界扫描；并给搜索类命令
-（`find`/`grep -r`/`rg`/`du`/`tree`）自动封顶 5 分钟超时；同时在会话开局注入一次输出纪律。
-目标不是把输出截断，而是**逼模型把 shell 写对**，同时**不把模型真正需要的载荷也拦掉**。
+A pi extension that catches "big output" from bash/powershell and returns only a few key lines + the
+full-output path on disk + **write-it-right advice based on the command type**; blocks unbounded scans
+rooted at `$HOME`, `/`, or a system dir (`/etc`, etc.) **before they run**; caps search commands
+(`find`/`grep -r`/`rg`/`du`/`tree`) at a 5-minute timeout; and injects an output-discipline note once
+at session start. The goal isn't to cut output — it's to **push the model to write shell right**,
+without **blocking the payload the model really needs**.
 
-## 行为
+## Behavior
 
-四件事，三硬一软：
+Four things, three hard and one soft:
 
-1. **开局立规矩（软）**：会话第一次 agent run 时注入一条 `[BASH OUTPUT DISCIPLINE]`
-   （`display: false`，只进模型上下文不进 TUI），告诉模型搜索/读文件/日志该怎么限量，
-   以及被 guard 拦截后该怎么办。普通会话只注入一次；compaction 后会在下一次 agent run 重新注入。
-2. **事前拦截无界扫描（硬）**：`tool_call` 阶段检测 `find`/`grep -r`/`rg`/`du`/`tree` 的扫描根目录；
-   若为 `$HOME`（含 `~`、`$HOME`、`${HOME}`、字面 home 路径）、`/`、或精确的系统目录
-   （`/etc`、`/var`、`/usr`、`/System`、`/Library`、`/Applications`、`/opt`、`/private`、`/bin`、`/sbin`、`/dev`、`/proc`），
-   **直接 block** 并返回收窄建议（`rg -l <pattern> ~/Projects`、`mdfind -name '<name>'`，或加 `-g '!Library/**'`）。
-   更深子目录（`/etc/nginx`、`~/Library/Preferences`）一律放行。动机：这类命令输出极小、现有字节 guard
-   完全拦不住，却要遍历几十 GB（真实事故 934 秒）。
-3. **搜索命令封顶 5 分钟（硬）**：`tool_call` 阶段，搜索类命令（`find`、递归 `grep`、`rg`、`du`、`tree`）
-   若未给 `timeout`、或给了大于 300 秒的值，就把 `input.timeout` 原地改写为 **300**；模型给了更小的值
-   则尊重（300 是上限，不是覆盖）。非搜索命令**完全不动**——`tail -f`/`watch`/前台 server 等长跑命令
-   照旧运行。
+1. **Set the rules up front (soft)**: on the session's first agent run, inject a `[BASH OUTPUT DISCIPLINE]`
+   note (`display: false`, model context only, not the TUI) that tells the model how to bound searches /
+   file reads / logs, and what to do when the guard steps in. A normal session gets it once; after
+   compaction it's injected again on the next agent run.
+2. **Block unbounded scans before they run (hard)**: at `tool_call`, check the scan root of
+   `find`/`grep -r`/`rg`/`du`/`tree`. If it's `$HOME` (including `~`, `$HOME`, `${HOME}`, a literal home
+   path), `/`, or an exact system dir (`/etc`, `/var`, `/usr`, `/System`, `/Library`, `/Applications`,
+   `/opt`, `/private`, `/bin`, `/sbin`, `/dev`, `/proc`), **block it** and return narrowing hints
+   (`rg -l <pattern> ~/Projects`, `mdfind -name '<name>'`, or add `-g '!Library/**'`). Deeper subdirs
+   (`/etc/nginx`, `~/Library/Preferences`) always pass. Why: these commands produce almost no output,
+   so the byte guard can't catch them at all, yet they walk tens of GB (a real incident took 934 seconds).
+3. **Cap search commands at 5 minutes (hard)**: at `tool_call`, for search commands (`find`, recursive
+   `grep`, `rg`, `du`, `tree`) with no `timeout` or a value over 300 seconds, rewrite `input.timeout` in
+   place to **300**; a smaller model-set value is respected (300 is a ceiling, not an override).
+   Non-search commands are **left completely alone** — long runners like `tail -f`/`watch`/foreground
+   servers keep going.
 
-   真实事故 `grep -rln ... ~/.pi ~/Projects ~/ensoai | grep -v ...` 因无 timeout 跑了 **5148 秒**；
-   现在这类命令会被自动压到 5 分钟。
-4. **超阈值硬拦截（硬）**：`tool_result` 阶段先给命令分类，再按类别用不同阈值：
+   A real incident: `grep -rln ... ~/.pi ~/Projects ~/ensoai | grep -v ...` ran for **5148 seconds**
+   with no timeout; now such commands are pulled to 5 minutes.
+4. **Hard block when over the limit (hard)**: at `tool_result`, classify the command first, then use a
+   different limit per class:
 
-   - **过程输出**（搜索/列举/转储：`rg`、递归 `grep`、`find`、`ls -R`、`env`、`ps`、`git log`…）
-     用**紧阈值**（默认 **8KB**）：替换成预览 + 全文路径 + **重写建议**，并计入重复/升级警告。
-   - **高价值载荷**（其余命令，含 `cat`/`sed` 这类读文件，以及 `pnpm build`/`pytest` 这类构建测试）
-     用**宽阈值**（默认 **30KB**）：低于阈值**原样放行**，超过才落盘，且**不说教**，只给
-     「全文在哪、用 `read`/`grep` 工具按需取」的指引。
+   - **Process output** (search/list/dump: `rg`, recursive `grep`, `find`, `ls -R`, `env`, `ps`,
+     `git log`…): uses the **tight limit** (default **8KB**). Replaced with a preview + full path +
+     **rewrite hints**, and counted for repeat/escalation warnings.
+   - **Valuable payload** (everything else, including file reads like `cat`/`sed` and builds/tests
+     like `pnpm build`/`pytest`): uses the **wide limit** (default **30KB**). Under the limit it
+     **passes through untouched**; over it, it's saved to disk with **no lecturing** — just where the
+     full output is and how to pull only what's needed with the `read`/`grep` tools.
 
-   两个类别都保留：头/尾预览（连续重复行折叠为 `(×N)`）、自动抽取的报错/警告行、全文落盘路径。
+   Both classes keep: head/tail preview (repeated lines folded to `(×N)`), auto-picked error/warning
+   lines, and the full-output path on disk.
 
-   「过程输出」被拦时的样例：
+   Sample when "process output" is intercepted:
 
 ```
 [BASH OUTPUT GUARD] Output withheld: 1842 lines / 214.3KB (limit 8.0KB).
 
 Preview — first 20 lines:
-  <头 20 行，连续重复行折叠为 (×N)>
+  <first 20 lines, repeated lines folded to (×N)>
   ... [1795 lines omitted] ...
 Preview — last 15 lines:
-  <尾 15 行>
+  <last 15 lines>
 
 Error/warning lines:
-  <自动抽取的报错/警告行，最多 15 条>
+  <auto-picked error/warning lines, up to 15>
 
 Full output saved to: /var/folders/.../pi-bash-guard-XXXX/output-0.txt
 Read it selectively: the `read` tool with offset/limit, or the `grep` tool pointed at this file.
@@ -57,7 +66,7 @@ Rewrite the command instead of repeating it. Do NOT re-run the same command, and
   - Cap the search: `rg -l <pattern>` lists matching files only, `-c` counts per file, or `-m 5` / `--max-count=5` caps matches per file.
 ```
 
-   「高价值载荷」被拦时的样例（没有重写说教）：
+   Sample when "valuable payload" is intercepted (no rewrite lecture):
 
 ```
 [BASH OUTPUT GUARD] Large result saved to disk: 3200 lines / 41.2KB (inline limit 30.0KB).
@@ -70,115 +79,134 @@ process-output limit. The full output is in the file above; read only the parts 
 re-run the command.
 ```
 
-不做的事：**不预判输出大小**（不自动给命令加 `| head`，那会破坏重定向/管道语义），
-也**不覆写安装的 `bash` 工具**（pi 内建已经做 2000 行/50KB 截断并落盘全文，本插件
-在此基础上收紧紧阈值、放宽载荷阈值并加「重写」指令）。命令级干预只有两处：上面第 2 条的
-`$HOME`/`/`/系统目录扫描**事前 block**；以及第 3 条的**搜索命令封顶 5 分钟**（非搜索命令不碰）。
+What it does NOT do: **no guessing output size** (it won't auto-add `| head`, which would break
+redirection/pipe semantics), and it does **not override the installed `bash` tool** (pi's built-in
+already truncates at 2000 lines/50KB and saves the full text; this extension tightens the tight limit,
+widens the payload limit, and adds "rewrite" advice on top). Command-level intervention happens in
+exactly two places: the `$HOME`/`/`/system-dir scan **pre-block** in point 2, and the **5-minute search
+cap** in point 3 (non-search commands are never touched).
 
-## 亮点
+## Highlights
 
-- **针对性建议**：按原命令特征给具体改写（`cat` → `read`/`sed`；无界 `rg` → `-l`/`-c`/`-m`；
-  `git log` → `--oneline -n 20`；`find`/`ls -R`/`du -a`/`env`/`docker logs`……）。
-- **错误不埋**：`isError` 时尾部预览加长，并先抽取 `Error`/`Traceback`/`npm ERR!` 等信号行顶到前面。
-- **重复踩坑升级（只对过程输出）**：过程输出类同一命令再次被拦截会提示「已拦截过」；本会话该类第 3 次起追加升级警告。高价值载荷被反复读取是合理的，不计入。
-- **按类别分档**：先把命令归为「过程输出 / 构建测试 / 其余载荷」（保守白名单，判定不了就当载荷），再用 8KB / 30KB 两档阈值，避免把模型真正需要的内容也逼去「落盘 + 分段读」。
-- **搜索有界、其余放手**：只给搜索类命令自动封顶 5 分钟，且尊重模型更小的显式预算；
-  非搜索命令完全不碰，既不误伤长构建，也堵住「递归搜索跑几十分钟无人察觉」的洞。
-- **全文可回查**：优先复用内建 bash 截断时落盘的**完整**输出；否则把当前文本写到本插件临时文件，
-  会话结束自动清理。模型可 `read` + offset/limit 或对其 `rg`/`sed` 定向读取。
-- **缓存安全**：只做 `tool_result` 的尾部 append-only 改写；不修改 systemPrompt、不动工具集、
-  不注册 `context` 处理器。
+- **Targeted advice**: specific rewrites based on the original command (`cat` → `read`/`sed`; unbounded
+  `rg` → `-l`/`-c`/`-m`; `git log` → `--oneline -n 20`; `find`/`ls -R`/`du -a`/`env`/`docker logs`…).
+- **Errors stay visible**: on `isError` the tail preview is longer, and signal lines like
+  `Error`/`Traceback`/`npm ERR!` are pulled to the front.
+- **Repeat-offender escalation (process output only)**: seeing the same process-output command again
+  says "already intercepted"; the 3rd such hit in a session adds an escalation warning. Re-reading
+  valuable payload is fine and doesn't count.
+- **Limits per class**: classify the command as "process output / build-test / other payload" first
+  (strict allowlist, unsure means payload), then apply the 8KB / 30KB limits, so content the model
+  really needs isn't pushed into "save to disk + read in slices".
+- **Bound searches, leave the rest alone**: only search commands get the auto 5-minute cap, and a
+  smaller explicit budget is respected; non-search commands are never touched, so long builds aren't
+  hurt and "recursive search runs for tens of minutes unnoticed" is closed off.
+- **Full output is retrievable**: prefer reusing the **complete** output the built-in bash truncation
+  saved; otherwise write the current text to this extension's temp file, cleaned up at session end.
+  The model can `read` with offset/limit or `rg`/`sed` it directly.
+- **Cache-safe**: only append-only rewrites at the tail of `tool_result`; no systemPrompt changes, no
+  tool-set changes, no `context` handlers.
 
-## 安装
+## Install
 
 ```bash
-# 不安装、临时体验当前目录
+# no install, try the current dir
 pi -e .
 
-# 或写进 settings 的本地包
+# or add the local package to settings
 pi install /Users/jooooody/Projects/pi-extension-bash-guard
 
-# 或手动拷贝（单文件入口）
+# or copy it manually (single-file entry)
 cp -r src ~/.pi/agent/extensions/bash-guard/
 ```
 
-装完 `/reload` 热加载；`pi list` 查看已装包，`pi remove ...` 卸载。
+After install, `/reload` to hot-load it; `pi list` shows installed packages and `pi remove ...` uninstalls.
 
-## 平台限制
+## Platform limits
 
-`powershell` 工具也会经过字节输出 guard 和可识别搜索命令的 timeout 上限；但扫描 root 解析器主要按 POSIX shell 语法实现，尚不是完整的 PowerShell parser。Windows 路径、PowerShell 原生命令（如 `Get-ChildItem -Recurse`）、反引号转义等情况可能漏掉事前扫描拦截。需要严格扫描保护时，请使用 bash/`rg` 等可被解析的命令，或关闭/调整对应策略前先人工确认。
+The `powershell` tool also goes through the byte-output guard and the timeout cap for recognizable
+search commands; but the scan-root parser is built mainly for POSIX shell syntax and isn't a full
+PowerShell parser yet. Windows paths, native PowerShell commands (like `Get-ChildItem -Recurse`), and
+backtick escapes can slip past the pre-run scan block. For strict scan protection, use commands the
+parser understands (bash/`rg`), or confirm by hand before turning the policy off or changing it.
 
-## 配置
+## Config
 
-命令：
+Commands:
 
-| 命令 | 效果 |
+| Command | Effect |
 |---|---|
-| `/bash-guard` | 开/关切换 |
-| `/bash-guard on` / `off` | 显式开关 |
-| `/bash-guard status` | 显示当前阈值、预览行数、扫描拦截开关、本会话拦截次数 |
-| `/bash-guard scan on` / `off` | 单独开关「`$HOME`/`/`/系统目录的扫描事前拦截」 |
-| `/bash-guard bytes 8192` | 改过程输出的字节阈值（`0` = 该档不限；总开关用 `on`/`off`） |
-| `/bash-guard payload 30720` | 改高价值载荷的字节阈值（`0` = 该档不限） |
-| `/bash-guard preview 25 15` | 改头/尾预览行数 |
+| `/bash-guard` | toggle on/off |
+| `/bash-guard on` / `off` | explicit on/off |
+| `/bash-guard status` | show current limits, preview lines, scan-block switch, session hit count |
+| `/bash-guard scan on` / `off` | toggle the "pre-block scans of `$HOME`/`/`/system dirs" rule alone |
+| `/bash-guard bytes 8192` | change the process-output byte limit (`0` = no limit for this tier; use `on`/`off` for the master switch) |
+| `/bash-guard payload 30720` | change the valuable-payload byte limit (`0` = no limit for this tier) |
+| `/bash-guard preview 25 15` | change head/tail preview lines |
 
-配置通过 `pi.appendEntry` 持久化进会话，resume 时重放。
+Config is saved into the session with `pi.appendEntry` and replayed on resume.
 
-环境变量作为**新会话初值**（会话里有持久化配置时以持久化配置为准）：
+Env vars act as **new-session seed values** (a saved session config wins):
 
-| 变量 | 默认 | 说明 |
+| Var | Default | Notes |
 |---|---|---|
-| `PI_BASH_GUARD_DISABLED` | — | 设为非空非 0 值即默认关闭 |
-| `PI_BASH_GUARD_ENABLED=0` | — | 默认关闭 |
-| `PI_BASH_GUARD_SCAN_BLOCK=0` | — | 默认开启；设为 `0`/`false`/`off`/`no` 关闭扫描事前拦截 |
-| `PI_BASH_GUARD_MAX_BYTES` | `8192` | 过程输出的字节阈值，0 = 该档不限制字节（两档独立） |
-| `PI_BASH_GUARD_PAYLOAD_MAX_BYTES` | `30720` | 高价值载荷的字节阈值，0 = 该档不限制 |
-| `PI_BASH_GUARD_PREVIEW_HEAD` | `20` | 头部预览行数 |
-| `PI_BASH_GUARD_PREVIEW_TAIL` | `15` | 尾部预览行数（成功时） |
-| `PI_BASH_GUARD_ERROR_TAIL` | `25` | 尾部预览行数（失败时） |
+| `PI_BASH_GUARD_DISABLED` | — | any non-empty, non-0 value turns it off by default |
+| `PI_BASH_GUARD_ENABLED=0` | — | off by default |
+| `PI_BASH_GUARD_SCAN_BLOCK=0` | — | on by default; set to `0`/`false`/`off`/`no` to turn off the scan pre-block |
+| `PI_BASH_GUARD_MAX_BYTES` | `8192` | process-output byte limit, 0 = no byte limit for this tier (tiers are independent) |
+| `PI_BASH_GUARD_PAYLOAD_MAX_BYTES` | `30720` | valuable-payload byte limit, 0 = no limit for this tier |
+| `PI_BASH_GUARD_PREVIEW_HEAD` | `20` | head preview lines |
+| `PI_BASH_GUARD_PREVIEW_TAIL` | `15` | tail preview lines (on success) |
+| `PI_BASH_GUARD_ERROR_TAIL` | `25` | tail preview lines (on failure) |
 
-状态栏：启用时显示 `🛡 bash-guard`，有拦截后显示 `🛡 bash-guard ×N`。
+Status bar: shows `🛡 bash-guard` when enabled, `🛡 bash-guard ×N` after interceptions.
 
-## 设计取舍
+## Design trade-offs
 
-- **为什么分两档阈值**：一个全局阈值会把「过程噪声」和「高价值载荷」焊在一起——后者一旦被拦，
-  就逼模型走「落盘 + 分段读」，反而更贵、也更容易漏读。命令分类只做保守白名单，判定不了就按载荷放行，
-  误差方向是「多给内容」而不是「吞内容」。
-- **为什么用 `tool_result` 而不是 `tool_call`**：只有拿到输出才知道大不大；在 `tool_call`
-  盲加 `| head` 会破坏重定向、改变退出码语义，还可能把错误截掉。
-- **只限字节、不限行数**：上下文成本≈字节数（~4 字符/token），行数与 token 不直接相关；
-  默认 8KB ≈ 2k token。行数多但每行短（如 2000 行 `a` ≈ 4KB）其实不贵，不应被拦。
-- **为什么不覆写 `bash` 工具**：pi 内建已实现截断 + 全文落盘 + 会话环境注入 + 渲染器，
-  覆写等于复制一份并长期跟随上游漂移；`tool_result` 的 content patch 足够。
-- **为什么覆盖不到 `read`/`grep`/`find`**：这些内建工具本身就有结构化截断和
-  offset/limit/head_limit 参数，v1 不重复处理。
-- **为什么搜索命令注入 `timeout` 而不是 block**：`tool_call` 的 `input` 可变，直接把 `timeout`
-  压到 300 秒即可生效，不必多一次「拦截→重发」往返；而且这是上限语义——模型给了更小预算就照用。
-  代价是模型可能不知道被压过，但命中时 `[BASH TIMEOUT GUARD]` 的报错引导会兜底。
-- **为什么其他命令全放开**：`tail -f`/`watch`/前台 server 的真实意图就是长跑，硬拦只会逼模型
-  写 `timeout: 999999` 绕过；把约束只加在「搜索」这一唯一确定有界需求的类别上，摩擦最小。
+- **Why two limits**: one global limit would weld "process noise" and "valuable payload" together —
+  once the latter is intercepted, the model is pushed into "save + read in slices", which costs more
+  and is easier to under-read. Command classification is a strict allowlist; unsure means payload, so
+  the error direction is "give more content", not "swallow content".
+- **Why `tool_result`, not `tool_call`**: you only know if output is big once you have it; blindly
+  adding `| head` at `tool_call` would break redirection, change exit-code meaning, and might cut off
+  errors.
+- **Bytes only, not lines**: context cost ≈ bytes (~4 chars/token); line count doesn't track tokens.
+  Default 8KB ≈ 2k tokens. Many short lines (e.g. 2000 lines of `a` ≈ 4KB) aren't expensive and
+  shouldn't be intercepted.
+- **Why not override the `bash` tool**: pi's built-in already does truncation + full-output save +
+  session env injection + a renderer; overriding means copying it and tracking upstream drift forever.
+  A `tool_result` content patch is enough.
+- **Why not cover `read`/`grep`/`find`**: those built-ins already have structured truncation and
+  offset/limit/head_limit params, so v1 doesn't handle them again.
+- **Why inject a search `timeout` instead of blocking**: `tool_call`'s `input` is mutable, so pulling
+  `timeout` to 300 seconds takes effect right away with no extra "block → resend" round trip; and it's
+  a ceiling — a smaller model-set budget is used as is. The cost is the model may not know it was
+  capped, but the `[BASH TIMEOUT GUARD]` error hint covers that on a hit.
+- **Why leave all other commands alone**: `tail -f`/`watch`/foreground servers are meant to run long;
+  hard-blocking would only push the model to write `timeout: 999999` and bypass it. Putting the limit
+  only on "search" — the one class with a definite bounded need — keeps friction lowest.
 
-## 开发
+## Development
 
 ```bash
 pnpm install
 pnpm test        # vitest
 pnpm typecheck   # tsc --noEmit
-pnpm check:biome # lint + format 检查
+pnpm check:biome # lint + format check
 ```
 
-目录：
+Layout:
 
 ```
-src/index.ts          插件装配：事件、/bash-guard 命令、状态栏、临时文件生命周期
-src/config.ts         阈值默认值、env 初值、命令参数解析、会话持久化重放
-src/analyze.ts        尺寸评估、内建 footer 剔除、预览裁剪、重复行折叠、信号行抽取
-src/classify.ts       命令归类：过程输出 / 构建测试 / 高价值载荷（保守白名单，词汇表参考 claude-code）
-src/suggest.ts        命令启发式 -> 重写建议
-src/scan-guard.ts     扫描解析：引号感知段切分 + tokenizer + find/grep/rg/du/tree root 判定
-src/timeout-guard.ts  搜索命令 5 分钟超时封顶（纯函数）
-src/guard-message.ts  组装最终 guard 文本
-tests/                纯函数 + 端到端（mockPi）用例
+src/index.ts          plugin wiring: events, /bash-guard command, status bar, temp-file lifecycle
+src/config.ts         limit defaults, env seeds, command arg parsing, session-persist replay
+src/analyze.ts        size checks, built-in footer removal, preview trim, repeat folding, signal pickup
+src/classify.ts       command classes: process output / build-test / valuable payload (strict allowlist, word list from claude-code)
+src/suggest.ts        command heuristics -> rewrite hints
+src/scan-guard.ts     scan parsing: quote-aware segment split + tokenizer + find/grep/rg/du/tree root check
+src/timeout-guard.ts  5-minute timeout cap for search commands (pure helper)
+src/guard-message.ts  build the final guard text
+tests/                pure helpers + end-to-end (mockPi) cases
 ```
 
 ## License

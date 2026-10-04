@@ -1,12 +1,12 @@
 /**
- * 组装最终返回给模型的 guard 文本。
+ * Build the guard text that goes back to the model.
  *
- * 目标不是「把输出截断」，而是「让模型用对的方式拿到它需要的信息」：
+ * The goal isn't to cut output, it's to get the model the info it needs in the right way:
  *
- * - `exhaust`（搜索/列举/转储这类过程输出）：给少量核心行、给全文路径、
- *   给针对原命令的具体改写建议，并明确禁止重复原命令 / 改用 less。
- * - 其他（高价值载荷）：内容很可能就是模型要的答案，所以**不说教**，
- *   只给「全文在哪、怎么按需取」的指引，避免逼它走「落盘 + 分段读」的绕路。
+ * - `exhaust` (process output like search/list/dump): a few key lines, the full-file path, rewrite
+ *   hints for the original command, and a clear "don't repeat it or pipe it to less".
+ * - everything else (valuable payload): likely the answer itself, so no lecturing — just where the
+ *   full output is and how to pull only what's needed, so it isn't forced into "save + read in slices".
  */
 
 import {
@@ -23,14 +23,14 @@ import type { CommandClass } from "./classify";
 import type { GuardConfig } from "./config";
 import { suggestRewrites } from "./suggest";
 
-/** 信号行最多展示条数。 */
+/** Max signal lines to show. */
 const SIGNAL_LINE_LIMIT = 15;
-/** 单行最大字符数，防止把「一行刷屏」的超长行原样带回。 */
+/** Max chars per line, so one giant line can't flood the screen. */
 const MAX_LINE_CHARS = 400;
-/** guard 文本的最大字节上限；实际预算还会受当前输出档位限制。 */
+/** Max bytes for the guard text; the real budget is also capped by the current output tier. */
 const MAX_MESSAGE_BYTES = 12 * 1024;
 
-/** 按 UTF-8 字节截取，避免 UTF-16 slice 切断 surrogate pair。 */
+/** Cut by UTF-8 bytes so a UTF-16 slice can't split a surrogate pair. */
 function truncateUtf8(text: string, maxBytes: number): string {
 	if (maxBytes <= 0) return "";
 	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
@@ -47,28 +47,27 @@ function truncateUtf8(text: string, maxBytes: number): string {
 }
 
 export interface GuardMessageInput {
-	/** 工具返回的原始文本。 */
 	text: string;
 	assessment: Assessment;
-	/** 原始命令。 */
+	/** The original command. */
 	command: string;
-	/** 命令归类，决定用紧阈值说教还是宽阈值给取回指引。 */
+	/** Command bucket: picks tight-limit lecturing or wide-limit retrieval hints. */
 	commandClass: CommandClass;
-	/** 全文落盘路径（复用内建或本插件自建）。 */
+	/** Full-output path on disk (reused built-in truncation file, or one we made). */
 	fullPath: string;
-	/** 内建 bash 工具在本次调用中是否已经触发过截断。 */
+	/** Whether the built-in bash tool already truncated this call. */
 	builtinTruncated: boolean;
 	isError: boolean;
 	cfg: GuardConfig;
-	/** 本会话中「过程输出」类被拦截的累计次数（1-based）；仅该类参与升级警告。 */
+	/** Running count of process-output interceptions this session (1-based); only this class triggers escalation. */
 	escalationCount: number;
-	/** 是否应在本条消息中发出一次性升级警告。 */
+	/** Whether to emit the one-time escalation warning in this message. */
 	showEscalationWarning?: boolean;
-	/** 归一化后的同一命令之前是否已被拦截过。 */
+	/** Whether this same normalized command was already intercepted before. */
 	repeatCommand: boolean;
 }
 
-/** 截断超长单行，追加省略标记。 */
+/** Trim an over-long line and add an ellipsis marker. */
 export function clipLine(line: string, max = MAX_LINE_CHARS): string {
 	if (line.length <= max) return line;
 	return `${line.slice(0, max)}… [+${line.length - max} chars]`;
@@ -78,7 +77,7 @@ function renderCollapsed(lines: CollapsedLine[], indent: string): string[] {
 	return lines.map(({ line, count }) => `${indent}${clipLine(line)}${count > 1 ? `  (×${count})` : ""}`);
 }
 
-/** 组装 guard 文本。纯函数，便于单测。 */
+/** Build the guard text. */
 export function buildGuardMessage(input: GuardMessageInput): string {
 	const {
 		text,

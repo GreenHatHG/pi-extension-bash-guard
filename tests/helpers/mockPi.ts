@@ -1,6 +1,7 @@
 /**
- * 共享的 pi 运行时 mock：模拟 extension 注册、命令、消息注入、tool_result 改写、
- * 会话条目重放与状态栏。每个测试创建独立实例，互不污染。
+ * Shared pi runtime mock: fakes extension registration, commands, message injection,
+ * tool_result rewriting, session entry replay, and the status bar. Each test gets its own instance,
+ * so nothing leaks between tests.
  */
 export type Handler = (event: any, ctx: any) => Promise<any>;
 
@@ -52,26 +53,26 @@ export function createMockRuntime() {
 		},
 	};
 
-	/** 触发一个事件（按注册顺序调用所有 handler），返回最后一个 handler 的返回值。 */
+	/** Fire an event (call all handlers in registration order); return the last handler's value. */
 	const emit = async (name: string, event: any = {}) => {
 		let last: any;
 		for (const h of handlers.get(name) ?? []) last = await h(event, ctx);
 		return last;
 	};
 
-	/** 执行已注册命令（模拟 pi 命令入口）。 */
+	/** Run a registered command (mimics pi's command entry). */
 	const runCommand = async (name: string, args = "") => {
 		const cmd = commands.get(name);
 		if (!cmd) throw new Error(`unknown command: ${name}`);
 		await cmd.handler(args, ctx);
 	};
 
-	/** 模拟一次 agent run 的启动消息注入：返回 before_agent_start 的返回值。 */
+	/** Mimic the start-of-agent-run message injection; returns the before_agent_start value. */
 	const startAgent = async (prompt = "do the thing") => {
 		return emit("before_agent_start", { prompt });
 	};
 
-	/** 模拟一次 bash 工具结果，返回 tool_result handler 的改写结果（无改写为 undefined）。 */
+	/** Mimic a bash tool result; returns the tool_result handler rewrite (undefined if none). */
 	const runToolResult = async (opts: {
 		toolName?: string;
 		command?: string;
@@ -91,7 +92,7 @@ export function createMockRuntime() {
 		return emit("tool_result", event);
 	};
 
-	/** 创建一个全新插件实例（default(pi) 每次调用都创建全新 state）。 */
+	/** Create a fresh plugin instance (default(pi) builds fresh state each call). */
 	const newPlugin = async () => {
 		const mod = await import("../../src/index.ts");
 		mod.default(pi);

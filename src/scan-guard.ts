@@ -1,30 +1,31 @@
 /**
- * 纯函数：解析 `find` / `grep` / `rg` / `du` / `tree` 的扫描 root 操作数；并据此检测
- * 「根目录为 $HOME 或 /」的无界扫描。
+ * Pure helper: find the scan root of `find` / `grep` / `rg` / `du` / `tree`, to catch unbounded
+ * scans rooted at `$HOME` or `/`.
  *
- * 动机：现有 output guard 只在 `tool_result` 阶段看**输出字节**，像
- * `grep -rl X ~ | head` 这种命令输出极小、却要遍历整个 home（macOS 光 `~/Library`
- * 就几十 GB）的命令完全拦不住——真实事故跑了 934 秒。这里在 `tool_call` 阶段事前拦截。
+ * The output guard only sees bytes at `tool_result`, so a command like `grep -rl X ~ | head` — tiny
+ * output but walks the whole home dir (on macOS `~/Library` alone is tens of GB) — slips through.
+ * So we block it earlier, at `tool_call`.
  *
- * 解析分两层，刻意不写完整 shell 解析器：
- * 1. **段切分**：按 `;&|\n` 切，但**引号感知**——模式里的 `"a\|b"` 不能被当成管道。
- * 2. **段内 tokenizer**：处理单/双引号与反斜杠转义，才能正确拿到 `find "$HOME"` 的 root。
+ * Parsing has two layers; this is not a full shell parser:
+ * 1. Split on `;&|\n`, quote-aware — a `"a\|b"` pattern must not count as a pipe.
+ * 2. Tokenize inside a segment, handling single/double quotes and backslash escapes, so we can read
+ *    the root in `find "$HOME"`.
  *
- * 归一化只做**字面匹配**（`~` / `$HOME` / `${HOME}` / 字面 home 路径 / `/` / 精确系统目录），
- * 不做真实路径解析。`/Users/x/../x`、home 的符号链接别名会漏报——这是刻意的：
- * 目标是少误伤，而不是抓对抗样本（纯函数也不该去 stat）。
+ * Matching is literal only (`~` / `$HOME` / `${HOME}` / a literal home path / `/` / an exact system
+ * dir); we don't resolve real paths. `/Users/x/../x` and symlinked home aliases slip past on purpose:
+ * we want few false hits, not to catch attackers (and a pure helper shouldn't stat anyway).
  *
- * 拦截集合（只匹配**精确 root**，更深子目录一律放行）：
- * - `root`：文件系统根 `/`。
- * - `home`：整个 home（`~`、`$HOME`、`${HOME}`、字面 home 路径）。
- * - `system`：`/etc`、`/var`、`/usr` 这类系统目录（`/etc/nginx` 这种子目录不拦）。
+ * The block list matches exact roots only; deeper subdirs always pass:
+ * - `root`: the filesystem root `/`.
+ * - `home`: the whole home dir (`~`, `$HOME`, `${HOME}`, a literal home path).
+ * - `system`: system dirs like `/etc`, `/var`, `/usr` (subdirs like `/etc/nginx` pass).
  */
 
-/** 段首的环境变量赋值前缀（`FOO=bar cmd`）。 */
+/** Leading env assignment at segment start (`FOO=bar cmd`). */
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
-/** `${HOME}` 字面量（拼接以避免被 lint 误认为模板占位符）。 */
+/** The `${HOME}` literal (built by joining so lint doesn't read it as a template placeholder). */
 const BRACED_HOME = "$" + "{HOME}";
-/** 会被跳过的命令包装器。 */
+/** Command wrappers we skip past. */
 const WRAPPERS = new Set([
 	"sudo",
 	"doas",
@@ -38,7 +39,7 @@ const WRAPPERS = new Set([
 	"time",
 	"stdbuf",
 ]);
-/** 包装器里「后面跟一个值」的选项（宁多勿少：多吞只会漏报，不会误伤）。 */
+/** Wrapper flags that take a value (err on the side of eating more: that only under-reports, never over-blocks). */
 const WRAPPER_VALUE_FLAGS = new Set([
 	"-u",
 	"-g",
@@ -60,9 +61,9 @@ const WRAPPER_VALUE_FLAGS = new Set([
 	"-o",
 	"-e",
 ]);
-/** `grep` 短选项里「后面跟一个值」的字母。 */
+/** `grep` short flags whose letter takes a value. */
 const GREP_SHORT_VALUE_FLAGS = new Set(["e", "f", "m", "A", "B", "C"]);
-/** `grep` 长选项里「后面跟一个值」的名字（含 `--`）。 */
+/** `grep` long flags that take a value (including `--`). */
 const GREP_LONG_VALUE_FLAGS = new Set([
 	"--regexp",
 	"--file",
@@ -80,9 +81,9 @@ const GREP_LONG_VALUE_FLAGS = new Set([
 	"--directories",
 	"--group-separator",
 ]);
-/** `rg` 短选项里「后面跟一个值」的字母（注意 `-r` 是 --replace，不是递归）。 */
+/** `rg` short flags whose letter takes a value (note `-r` is --replace, not recursive). */
 const RG_SHORT_VALUE_FLAGS = new Set(["e", "f", "r", "t", "T", "g", "m", "A", "B", "C", "j", "M", "E"]);
-/** `rg` 长选项里「后面跟一个值」的名字（含 `--`）。 */
+/** `rg` long flags that take a value (including `--`). */
 const RG_LONG_VALUE_FLAGS = new Set([
 	"--regexp",
 	"--file",
@@ -110,12 +111,12 @@ const RG_LONG_VALUE_FLAGS = new Set([
 	"--colors",
 ]);
 
-/** 被拦截的扫描类型：`root` = 文件系统根，`home` = 整个 home 目录，`system` = 系统目录。 */
+/** Scan kinds we block: `root` = filesystem root, `home` = whole home dir, `system` = system dir. */
 export type ScanKind = "root" | "home" | "system";
 
 /**
- * 精确匹配才拦截的系统目录（子目录如 `/etc/nginx` 放行）。macOS 与 Linux 常见路径的并集，
- * 多出的一两个在另一平台不存在也无害。
+ * System dirs we block on an exact match (subdirs like `/etc/nginx` pass). A union of common macOS
+ * and Linux paths; an extra one that doesn't exist on the other OS is harmless.
  */
 const SYSTEM_ROOTS = new Set([
 	"/etc",
@@ -133,34 +134,34 @@ const SYSTEM_ROOTS = new Set([
 ]);
 
 export interface ScanBlock {
-	/** 命中的命令，如 `find` / `grep` / `rg`。 */
+	/** The command that hit, e.g. `find` / `grep` / `rg`. */
 	tool: string;
-	/** 原始 root 参数（用于提示文案）。 */
+	/** The raw root argument (for the message text). */
 	root: string;
 	kind: ScanKind;
-	/** 返回给模型的拦截原因 + 收窄建议。 */
+	/** Block reason + narrowing hints sent back to the model. */
 	reason: string;
 }
 
-/** 一次解析出的扫描命令。 */
+/** One parsed scan command. */
 export interface ParsedScan {
-	/** 命令名（`find` / `grep` / `rg` / `du` / `tree`）。 */
+	/** Command name (`find` / `grep` / `rg` / `du` / `tree`). */
 	tool: string;
-	/** 是否会递归遍历目录。 */
+	/** Whether it walks directories recursively. */
 	recursive: boolean;
-	/** 扫描 root 操作数（grep/rg 已去掉 pattern）。 */
+	/** Scan root operands (pattern already removed for grep/rg). */
 	roots: string[];
 }
 
-/** 取路径的 basename，用于识别 `/usr/bin/grep` 这类绝对路径调用。 */
+/** Take a path's basename, to catch absolute calls like `/usr/bin/grep`. */
 export function basename(token: string): string {
 	const idx = token.lastIndexOf("/");
 	return idx >= 0 ? token.slice(idx + 1) : token;
 }
 
 /**
- * 段切分：按 `;` `&` `|` 换行切，但**引号感知**——双引号里的 `"a\|b"`（grep 交替模式）
- * 不能被当成管道。反斜杠转义的字符也不切。
+ * Split segments on `;` `&` `|` and newlines, quote-aware — a `"a\|b"` (grep alternation) inside
+ * double quotes must not count as a pipe. Backslash-escaped chars don't split either.
  */
 export function splitSegments(command: string): string[] {
 	const segments: string[] = [];
@@ -204,7 +205,7 @@ export function splitSegments(command: string): string[] {
 	return segments;
 }
 
-/** 段内 tokenizer：处理单引号（字面）、双引号（保留 `$VAR`、反斜杠转义）与反斜杠。 */
+/** Tokenizer inside a segment: handles single quotes (literal), double quotes (keep `$VAR` and escapes), and backslashes. */
 export function tokenizeSegment(segment: string): string[] {
 	const tokens: string[] = [];
 	let current = "";
@@ -219,7 +220,7 @@ export function tokenizeSegment(segment: string): string[] {
 				current += segment[i];
 				i++;
 			}
-			i++; // 跳过收尾单引号
+			i++; // skip the closing single quote
 			continue;
 		}
 		if (ch === '"') {
@@ -235,7 +236,7 @@ export function tokenizeSegment(segment: string): string[] {
 				current += inner;
 				i++;
 			}
-			i++; // 跳过收尾双引号
+			i++; // skip the closing double quote
 			continue;
 		}
 		if (ch === "\\" && i + 1 < segment.length) {
@@ -260,8 +261,8 @@ export function tokenizeSegment(segment: string): string[] {
 }
 
 /**
- * 去掉重定向（`2>/dev/null`、`> /tmp/out`、`<in`），避免把重定向目标误当成扫描 root。
- * 只在未加引号的 shell 语法中处理，避免把 `rg "a>b" .` 的模式破坏掉。
+ * Strip redirections (`2>/dev/null`, `> /tmp/out`, `<in`) so a redirect target isn't mistaken for a
+ * scan root. Only touches unquoted shell syntax, so `rg "a>b" .` keeps its pattern.
  */
 export function stripRedirections(segment: string): string {
 	let out = "";
@@ -328,7 +329,7 @@ export function stripRedirections(segment: string): string {
 	return out;
 }
 
-/** 剥掉段首的 `NAME=value` 赋值与 `sudo`/`env`/`xargs` 等包装器。 */
+/** Strip leading `NAME=value` assignments and wrappers like `sudo`/`env`/`xargs`. */
 export function stripWrappers(tokens: string[]): string[] {
 	const out = tokens.slice();
 	for (let guard = 0; guard < 10; guard++) {
@@ -345,7 +346,7 @@ export function stripWrappers(tokens: string[]): string[] {
 	return out;
 }
 
-/** 把 root 字面量归类为 `root` / `home` / `system`；其余（含 `.`、子目录）返回 null 表示放行。 */
+/** Classify a root literal as `root` / `home` / `system`; null means pass (including `.` and subdirs). */
 function classifyRoot(raw: string, home: string): ScanKind | null {
 	if (raw === "") return null;
 	if (/^\/+$/.test(raw)) return "root";
@@ -359,9 +360,9 @@ function classifyRoot(raw: string, home: string): ScanKind | null {
 	return null;
 }
 
-/** `find` 的 starting points（第一个 expression 选项之前的所有 operand）。 */
+/** `find` starting points (all operands before the first expression flag). */
 function findRoots(args: string[]): string[] {
-	// GNU find 允许多个 starting point，且 `-H`/`-L`/`-P`（无值）与 `-D`/`-O`（带值）可前置。
+	// GNU find allows several starting points; `-H`/`-L`/`-P` (no value) and `-D`/`-O` (value) may come first.
 	const PRE_NOARG = new Set(["-H", "-L", "-P"]);
 	const PRE_ARG = new Set(["-D", "-O"]);
 	let endOfOptions = false;
@@ -379,7 +380,7 @@ function findRoots(args: string[]): string[] {
 				i++;
 				continue;
 			}
-			break; // 进入 expression，其后不再是 starting point
+			break; // reached the expression, nothing after is a starting point
 		}
 		startingPoints.push(token);
 	}
@@ -387,8 +388,8 @@ function findRoots(args: string[]): string[] {
 }
 
 /**
- * `grep` 只有带递归开关（`-r`/`-R`/`--recursive`）时才会遍历目录；root 是
- * pattern 之后的操作数（有 `-e`/`-f` 时所有操作数都是 root）。
+ * `grep` only walks dirs with a recursive flag (`-r`/`-R`/`--recursive`); roots are the operands
+ * after the pattern (with `-e`/`-f`, every operand is a root).
  */
 function grepRoots(args: string[]): { recursive: boolean; roots: string[] } {
 	let recursive = false;
@@ -423,7 +424,7 @@ function grepRoots(args: string[]): { recursive: boolean; roots: string[] } {
 	return { recursive: true, roots: patternProvided ? operands : operands.slice(1) };
 }
 
-/** `rg` 默认递归；root 是 pattern 之后的操作数（有 `-e`/`-f` 时所有操作数都是 root）。 */
+/** `rg` is recursive by default; roots are the operands after the pattern (with `-e`/`-f`, every operand is a root). */
 function rgRoots(args: string[]): { recursive: boolean; roots: string[] } {
 	let patternProvided = false;
 	let endOfOptions = false;
@@ -453,7 +454,7 @@ function rgRoots(args: string[]): { recursive: boolean; roots: string[] } {
 	return { recursive: true, roots: patternProvided ? operands : operands.slice(1) };
 }
 
-/** `du`/`tree` 中需要单独消费一个值的选项；否则其值会被误当成扫描 root。 */
+/** `du`/`tree` flags that take a value; otherwise the value is mistaken for a scan root. */
 const DU_VALUE_FLAGS = new Set([
 	"-d",
 	"-t",
@@ -467,7 +468,7 @@ const DU_VALUE_FLAGS = new Set([
 ]);
 const TREE_VALUE_FLAGS = new Set(["-H", "-I", "-L", "-P", "-o", "--ignore", "--level", "--pattern", "--output"]);
 
-/** 非选项 operand（用于 `du`/`tree`），跳过选项及其独立值。 */
+/** Non-flag operands (for `du`/`tree`), skipping flags and their separate values. */
 function plainRoots(args: string[], valueFlags: Set<string>): string[] {
 	const roots: string[] = [];
 	let endOfOptions = false;
@@ -491,7 +492,7 @@ function plainRoots(args: string[], valueFlags: Set<string>): string[] {
 	return roots;
 }
 
-/** 提取 `$()` 与反引号中的嵌套命令，避免 shell command substitution 绕过扫描保护。 */
+/** Pull nested commands out of `$()` and backticks, so shell substitution can't dodge the scan block. */
 function extractNestedCommands(command: string): string[] {
 	const nested: string[] = [];
 	let quote: "'" | '"' | null = null;
@@ -588,7 +589,7 @@ function findCommandSubstitutionEnd(command: string, start: number): number {
 	return -1;
 }
 
-/** 解析命令里所有 `find`/`grep`/`rg`/`du`/`tree` 的扫描 root（按出现顺序）。 */
+/** Parse every `find`/`grep`/`rg`/`du`/`tree` scan root in the command, in order of appearance. */
 export function parseScanCommands(command: string, depth = 0): ParsedScan[] {
 	const out: ParsedScan[] = [];
 	if (!command || depth > 8) return out;
@@ -614,7 +615,7 @@ export function parseScanCommands(command: string, depth = 0): ParsedScan[] {
 	return out;
 }
 
-/** 组装拦截原因与收窄建议（模型可见）。 */
+/** Build the block reason and narrowing hints (model-visible). */
 export function buildScanReason(tool: string, root: string, kind: ScanKind): string {
 	const headline =
 		kind === "root"
@@ -638,8 +639,8 @@ export function buildScanReason(tool: string, root: string, kind: ScanKind): str
 }
 
 /**
- * 检测命令中是否存在根目录为 `$HOME`、`/` 或精确系统目录的无界扫描。
- * 命中返回 `ScanBlock`（含 reason），否则返回 null。
+ * Check whether the command has an unbounded scan rooted at `$HOME`, `/`, or an exact system dir.
+ * Returns a `ScanBlock` (with reason) on a hit, else null.
  */
 export function detectBlockedScan(command: string, opts: { home: string }): ScanBlock | null {
 	for (const scan of parseScanCommands(command)) {

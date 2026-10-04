@@ -2,13 +2,13 @@ import { describe, expect, test } from "vitest";
 import { DEFAULT_CONFIG, loadEnvConfig, parseCommandArgs, readPersistedConfig } from "../src/config";
 
 describe("loadEnvConfig", () => {
-	test("默认值", () => {
+	test("Defaults", () => {
 		expect(loadEnvConfig({})).toEqual(DEFAULT_CONFIG);
 		expect(DEFAULT_CONFIG.maxBytes).toBe(8192);
 		expect(DEFAULT_CONFIG.payloadMaxBytes).toBe(30 * 1024);
 	});
 
-	test("合法覆盖生效，非法值忽略", () => {
+	test("Valid overrides apply, invalid ones are ignored", () => {
 		const cfg = loadEnvConfig({
 			PI_BASH_GUARD_MAX_BYTES: "16384",
 			PI_BASH_GUARD_PAYLOAD_MAX_BYTES: "40960",
@@ -21,13 +21,13 @@ describe("loadEnvConfig", () => {
 		expect(cfg.previewTail).toBe(DEFAULT_CONFIG.previewTail);
 	});
 
-	test("PI_BASH_GUARD_DISABLED 关闭", () => {
+	test("PI_BASH_GUARD_DISABLED turns it off", () => {
 		expect(loadEnvConfig({ PI_BASH_GUARD_DISABLED: "1" }).enabled).toBe(false);
 		expect(loadEnvConfig({ PI_BASH_GUARD_ENABLED: "0" }).enabled).toBe(false);
 		expect(loadEnvConfig({ PI_BASH_GUARD_DISABLED: "0" }).enabled).toBe(true);
 	});
 
-	test("0 表示不限字节", () => {
+	test("0 means no byte limit", () => {
 		const cfg = loadEnvConfig({ PI_BASH_GUARD_MAX_BYTES: "0" });
 		expect(cfg.maxBytes).toBe(0);
 		expect(loadEnvConfig({ PI_BASH_GUARD_PAYLOAD_MAX_BYTES: "0" }).payloadMaxBytes).toBe(0);
@@ -35,7 +35,7 @@ describe("loadEnvConfig", () => {
 });
 
 describe("parseCommandArgs", () => {
-	test("空参数切换开关", () => {
+	test("Empty args toggle the switch", () => {
 		expect(parseCommandArgs("", DEFAULT_CONFIG)).toEqual({
 			kind: "config",
 			config: { ...DEFAULT_CONFIG, enabled: false },
@@ -57,7 +57,7 @@ describe("parseCommandArgs", () => {
 		expect(parseCommandArgs("status", DEFAULT_CONFIG)).toEqual({ kind: "status" });
 	});
 
-	test("bytes 设置阈值，0 表示不限制；lines 已被移除", () => {
+	test("bytes sets the limit, 0 means no limit; lines was removed", () => {
 		expect(parseCommandArgs("bytes 2048", DEFAULT_CONFIG)).toEqual({
 			kind: "config",
 			config: { ...DEFAULT_CONFIG, maxBytes: 2048 },
@@ -70,7 +70,7 @@ describe("parseCommandArgs", () => {
 		expect(parseCommandArgs("lines 120", DEFAULT_CONFIG).kind).toBe("error");
 	});
 
-	test("payload 设置载荷阈值，0 表示不限制", () => {
+	test("payload sets the payload limit, 0 means no limit", () => {
 		expect(parseCommandArgs("payload 40960", DEFAULT_CONFIG)).toEqual({
 			kind: "config",
 			config: { ...DEFAULT_CONFIG, payloadMaxBytes: 40960 },
@@ -82,7 +82,7 @@ describe("parseCommandArgs", () => {
 		expect(parseCommandArgs("payload abc", DEFAULT_CONFIG).kind).toBe("error");
 	});
 
-	test("preview 支持只改 head 或同时改 head/tail", () => {
+	test("preview can change head alone or head/tail together", () => {
 		expect(parseCommandArgs("preview 30", DEFAULT_CONFIG)).toEqual({
 			kind: "config",
 			config: { ...DEFAULT_CONFIG, previewHead: 30 },
@@ -93,17 +93,17 @@ describe("parseCommandArgs", () => {
 		});
 	});
 
-	test("未知参数报错", () => {
+	test("Unknown args error", () => {
 		expect(parseCommandArgs("bogus", DEFAULT_CONFIG).kind).toBe("error");
 	});
 });
 
 describe("readPersistedConfig", () => {
-	test("无条目返回 undefined", () => {
+	test("No entries returns undefined", () => {
 		expect(readPersistedConfig([])).toBeUndefined();
 	});
 
-	test("取最后一条并用默认值补齐缺失字段", () => {
+	test("Takes the last one and fills missing fields with defaults", () => {
 		const branch = [
 			{ type: "custom", customType: "bash-guard-config", data: { maxBytes: 1024 } },
 			{ type: "message" },
@@ -115,7 +115,7 @@ describe("readPersistedConfig", () => {
 		expect(cfg?.previewHead).toBe(DEFAULT_CONFIG.previewHead);
 	});
 
-	test("最新坏 config entry 跳过，继续找更旧的有效配置", () => {
+	test("Skips a bad newest config entry and keeps looking for an older valid one", () => {
 		const branch = [
 			{ type: "custom", customType: "bash-guard-config", data: { maxBytes: 1024 } },
 			{ type: "custom", customType: "bash-guard-config", data: null },
