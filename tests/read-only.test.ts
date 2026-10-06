@@ -173,6 +173,11 @@ describe("judgeReadOnlyCommand: denied", () => {
 		expect(ok("timeout 5 pnpm test")).toBe(false);
 		expect(ok("timeout")).toBe(false);
 	});
+	test("flags that reach another program or write are denied", () => {
+		expect(ok("git --exec-path=/tmp/evil log")).toBe(false);
+		expect(ok("git --upload-pack=sh log")).toBe(false);
+		expect(ok("jq --in-place '.x=1' data.json")).toBe(false);
+	});
 	test("bare bun REPL and bun -e are denied", () => {
 		expect(ok("bun")).toBe(false);
 		expect(reason("bun")).toContain("REPL");

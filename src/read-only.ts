@@ -10,7 +10,9 @@
  * segment and `git log --format='%s'` keeps its quotes.
  *
  * Where the input comes from: PI_BASH_GUARD_MODE (read from env only, never persisted — the mode
- * belongs to the process, not to a resumable session like the byte limits do).
+ * belongs to the process, not to a resumable session like the byte limits do). Note the fence only
+ * matches literal command names: it does not expand `${VAR}` or aliases, so a poisoned environment
+ * is outside what it can see.
  */
 
 import { basename, splitSegments, tokenizeSegment } from "./scan-guard";
@@ -242,19 +244,35 @@ function sedIsReadOnly(tokens: string[]): boolean {
 	return !tokens.some((t) => t === "-i" || t.startsWith("-i") || t === "--in-place" || t.startsWith("--in-place"));
 }
 
-/**
- * `rg --pre <cmd>` runs that command for every file, so it is an execution channel. `tail -f` and
- * `ls -R` never return, which is a hang rather than a hole, but a fenced process should not do it.
- * `tail -F`/`--follow` is a long option; the short form is `-f`, matched exactly so `-n` and
- * friends are untouched.
- */
-const RG_EXEC_FLAGS = new Set(["--pre", "--pre-glob", "--hostname-bin"]);
-const LONG_RUNNING_FLAGS = new Set(["-f", "-F", "--follow", "-R", "--recursive"]);
+/** `tail`/`ls` flags that never return. Short forms only match exactly, so `-n 50` is untouched. */
+const LONG_RUNNING_FLAGS = new Set(["-f", "-F", "-R"]);
 
-function hasAnyToken(tokens: string[], exact: Set<string>): boolean {
+function flagNameOf(token: string): string {
+	return token.split("=", 1)[0];
+}
+
+/**
+ * Any flag that points at a file or another program. `sed -i` is covered by sedIsReadOnly; these are
+ * here because the tool can write (`jq --in-place`) or execute (`rg --pre`, `git --exec-path`,
+ * `git --upload-pack`, `rg --hostname-bin`). A pattern that merely starts with `-` is still treated
+ * as a flag: saying no to a weird pattern costs one turn, saying yes to `--pre` costs the fence.
+ */
+const EXEC_OR_WRITE_FLAGS = new Set([
+	"--pre",
+	"--pre-glob",
+	"--hostname-bin",
+	"--exec-path",
+	"--upload-pack",
+	"--receive-pack",
+	"--in-place",
+	"--config-env",
+]);
+
+/** True when the command line carries a flag that writes a file or runs another program. */
+function hasDangerousFlag(tokens: string[], extra: Set<string> = new Set()): boolean {
 	return tokens.some((t) => {
-		const flag = t.split("=", 1)[0];
-		return exact.has(t) || exact.has(flag);
+		const name = flagNameOf(t);
+		return name.startsWith("-") && (extra.has(name) || EXEC_OR_WRITE_FLAGS.has(name));
 	});
 }
 
@@ -315,6 +333,11 @@ export function judgeReadOnlyCommand(command: string): ReadOnlyVerdict {
 		}
 
 		if (head === "git") {
+			if (hasDangerousFlag(tokens)) {
+				return deny(
+					"this git call passes a flag that can write or run another program, which this read-only session forbids.",
+				);
+			}
 			const sub = subcommandOf(tokens, GIT_GLOBAL_VALUE_FLAGS);
 			if (!sub || !GIT_READ_SUBCOMMANDS.has(sub)) {
 				return deny(`\`git ${sub ?? ""}\` is not read-only. Only read-only git subcommands are allowed here.`);
@@ -332,15 +355,22 @@ export function judgeReadOnlyCommand(command: string): ReadOnlyVerdict {
 
 		if (head === "rg") {
 			// allowlist: rg is a reader, but --pre turns it into a runner
-			const execFlag = tokens.find((t) => RG_EXEC_FLAGS.has(t.split("=", 1)[0]));
+			const execFlag = tokens.find((t) => EXEC_OR_WRITE_FLAGS.has(flagNameOf(t)));
 			if (execFlag) {
-				return deny(`\`rg ${execFlag}\` runs another program for every file, which this read-only session forbids.`);
+				return deny(
+					`\`rg ${flagNameOf(execFlag)}\` runs another program for every file, which this read-only session forbids.`,
+				);
 			}
-		} else if ((head === "tail" || head === "ls") && hasAnyToken(tokens, LONG_RUNNING_FLAGS)) {
+		} else if ((head === "tail" || head === "ls") && hasDangerousFlag(tokens, LONG_RUNNING_FLAGS)) {
 			return deny(`\`${head}\` with a follow/recursive flag never returns; this session only runs bounded commands.`);
 		}
 
 		if (PLAIN_COMMANDS.has(head)) {
+			if (hasDangerousFlag(tokens)) {
+				return deny(
+					`\`${head}\` was given a flag that writes a file or runs another program; this session is read-only.`,
+				);
+			}
 			if (head === "sed" && !sedIsReadOnly(tokens)) {
 				return deny(
 					"`sed -i` edits files in place, which this read-only session forbids. Use plain `sed -n` to print lines.",
