@@ -20,6 +20,7 @@ import { assessOutput, describeLimit } from "./analyze";
 import { classifyCommand } from "./classify";
 import { CONFIG_CUSTOM_TYPE, type GuardConfig, loadEnvConfig, parseCommandArgs, readPersistedConfig } from "./config";
 import { buildGuardMessage } from "./guard-message";
+import { judgeReadOnlyCommand, MODE_ENV, READ_ONLY_MODE, readOnlyMode } from "./read-only";
 import { detectBlockedScan } from "./scan-guard";
 import { isSearchCommand, SEARCH_TIMEOUT_SECONDS, searchTimeoutInjection } from "./timeout-guard";
 
@@ -50,13 +51,25 @@ export function normalizeCommand(command: string): string {
 }
 
 /** The output-discipline text injected at session start. */
-export function buildDisciplineText(cfg: GuardConfig): string {
+export function buildDisciplineText(cfg: GuardConfig, readOnly = false): string {
 	const exhaustLimit = describeLimit({ maxBytes: cfg.maxBytes });
 	const payloadLimit = describeLimit({ maxBytes: cfg.payloadMaxBytes });
 	const timeoutLine =
 		"Search commands (`find`, recursive `grep`, `rg`, `du`, `tree`) are capped at 5 minutes (300 seconds) automatically; " +
 		"scans rooted at `$HOME`, `/`, or a system directory like `/etc` are blocked before they run. " +
 		"Everything else runs with no timeout guard — pass an explicit `timeout` for anything that can hang (log follow, foreground servers).";
+	const fenceLines = readOnly
+		? [
+				"",
+				"[READ-ONLY SESSION] This session is fenced to read-only bash: every command is checked before it runs, and " +
+					"anything that writes, deletes, installs, builds, tests, or reaches the network is blocked with a " +
+					"`[BASH READ-ONLY FENCE]` reason. Read files with the `read` tool; use the recall CLI for session history; " +
+					"keep shell checks to bounded, read-only commands (`rg -l`, `sed -n`, `head`, `tail`, `wc`, `git log/show/diff`, `tmux capture-pane`). " +
+					"Two things that look harmless are blocked on purpose: anything that hands the command to another " +
+					"program (a wrapper like `sudo`/`env`/`xargs`, `rg --pre`, an interpreter), and `enclave`/`unboxexec` " +
+					"(a sandbox privilege channel, not a read-only command).",
+			]
+		: [];
 	return [
 		"[BASH OUTPUT DISCIPLINE]",
 		`An extension guards shell output. Search/listing/dump commands (e.g. \`rg\`, recursive \`grep\`, \`find\`, \`ls -R\`, ` +
@@ -71,6 +84,7 @@ export function buildDisciplineText(cfg: GuardConfig): string {
 		"- Aggregate first: `| wc -l`, `| sort | uniq -c`, `-q`/`--quiet`/`-s`. Write big output to a file, then read/grep it selectively.",
 		"",
 		timeoutLine,
+		...fenceLines,
 	].join("\n");
 }
 
@@ -123,6 +137,8 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	let cfg = loadEnvConfig();
 	let hitCount = 0;
 	let exhaustHits = 0;
+	/** Fence hits: kept apart from output-guard hits, they mean different things. */
+	let fenceHits = 0;
 	let framingDelivered = false;
 	let escalationWarningDelivered = false;
 	const guardedCommands = new Set<string>();
@@ -139,12 +155,16 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 
 	function updateStatus(ctx: ExtensionContext | undefined): void {
 		if (!ctx) return;
+		const mode = readOnlyMode();
 		try {
-			if (!cfg.enabled) {
+			// In a fenced process the mode matters even when the output guard is off, so show it either way
+			if (!cfg.enabled && mode === undefined) {
 				ctx.ui.setStatus(STATUS_KEY, undefined);
 				return;
 			}
-			ctx.ui.setStatus(STATUS_KEY, hitCount > 0 ? `🛡 bash-guard ×${hitCount}` : "🛡 bash-guard");
+			const label = mode === undefined ? "🛡 bash-guard" : mode === READ_ONLY_MODE ? "🛡 read-only" : `🛡 ${mode}`;
+			const hits = mode === undefined ? hitCount : fenceHits;
+			ctx.ui.setStatus(STATUS_KEY, hits > 0 ? `${label} ×${hits}` : label);
 		} catch {
 			// No-UI setups like print mode: ignore
 		}
@@ -154,6 +174,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => {
 		hitCount = 0;
 		exhaustHits = 0;
+		fenceHits = 0;
 		framingDelivered = false;
 		escalationWarningDelivered = false;
 		tempStorage.dir = undefined;
@@ -175,7 +196,9 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 
 	// ── Opening soft hint: inject once, cache-safe ────────────────────────────────
 	pi.on("before_agent_start", () => {
-		if (!cfg.enabled || framingDelivered) return;
+		// A fenced process always needs the notice, even if the output guard is off
+		const mode = readOnlyMode();
+		if ((!cfg.enabled && mode === undefined) || framingDelivered) return;
 		framingDelivered = true;
 		try {
 			pi.appendEntry(FRAMING_CUSTOM_TYPE, { delivered: true });
@@ -185,7 +208,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		return {
 			message: {
 				customType: FRAMING_CUSTOM_TYPE,
-				content: buildDisciplineText(cfg),
+				content: buildDisciplineText(cfg, mode === READ_ONLY_MODE),
 				display: false,
 			},
 		};
@@ -196,12 +219,34 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		framingDelivered = false;
 	});
 
-	// ── Pre-run block: unbounded scans rooted at $HOME, /, or a system dir ────────
+	// ── Pre-run block: fence the command, then block unbounded scans, then cap search timeouts ──
 	pi.on("tool_call", (event, ctx) => {
-		if (!cfg.enabled) return;
 		if (!GUARDED_TOOLS.has(event.toolName)) return;
 		const input = event.input as { command?: unknown; timeout?: unknown } | undefined;
 		const command = typeof input?.command === "string" ? input.command : "";
+
+		// Read-only fence runs first: a denied command should never reach the output guard's logic.
+		// It is env-driven, so it applies even if the output guard itself is switched off.
+		const mode = readOnlyMode();
+		if (mode !== undefined) {
+			if (mode !== READ_ONLY_MODE) {
+				// Unknown mode value means the injection is broken; fail closed instead of handing out bash
+				return {
+					block: true,
+					reason: `[BASH READ-ONLY FENCE] unknown ${MODE_ENV}="${mode}"; all bash is blocked until it is fixed.`,
+				};
+			}
+			if (command !== "") {
+				const verdict = judgeReadOnlyCommand(command);
+				if (!verdict.ok) {
+					fenceHits++;
+					updateStatus(ctx);
+					return { block: true, reason: `[BASH READ-ONLY FENCE] ${verdict.reason}` };
+				}
+			}
+		}
+
+		if (!cfg.enabled) return;
 		if (command === "") return;
 
 		if (cfg.scanBlock) {
@@ -316,10 +361,17 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			if (result.kind === "status") {
+				const mode = readOnlyMode();
+				const fenceLine =
+					mode === undefined
+						? "readonly fence: off (PI_BASH_GUARD_MODE not set)"
+						: mode === READ_ONLY_MODE
+							? `readonly fence: on (advisor allow list); blocked ${fenceHits}`
+							: `readonly fence: UNKNOWN mode "${mode}" -> all bash blocked (fail-closed)`;
 				ctx.ui.notify(
 					`bash-guard: ${cfg.enabled ? "on" : "off"}; exhaust limit ${describeLimit({ maxBytes: cfg.maxBytes })}; ` +
 						`payload ${describeLimit({ maxBytes: cfg.payloadMaxBytes })}; scan-block ${cfg.scanBlock ? "on" : "off"}; ` +
-						`preview head ${cfg.previewHead} / tail ${cfg.previewTail} (errors ${cfg.errorPreviewTail}); hits ${hitCount}`,
+						`preview head ${cfg.previewHead} / tail ${cfg.previewTail} (errors ${cfg.errorPreviewTail}); hits ${hitCount}; ${fenceLine}`,
 					"info",
 				);
 				return;

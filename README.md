@@ -3,7 +3,8 @@
 A pi extension that catches "big output" from bash/powershell and returns only a few key lines + the
 full-output path on disk + **write-it-right advice based on the command type**; blocks unbounded scans
 rooted at `$HOME`, `/`, or a system dir (`/etc`, etc.) **before they run**; caps search commands
-(`find`/`grep -r`/`rg`/`du`/`tree`) at a 5-minute timeout; and injects an output-discipline note once
+(`find`/`grep -r`/`rg`/`du`/`tree`) at a 5-minute timeout; can fence a whole process to **read-only bash**
+(`PI_BASH_GUARD_MODE=advisor`); and injects an output-discipline note once
 at session start. The goal isn't to cut output — it's to **push the model to write shell right**,
 without **blocking the payload the model really needs**.
 
@@ -27,6 +28,21 @@ Four things, three hard and one soft:
    place to **300**; a smaller model-set value is respected (300 is a ceiling, not an override).
    Non-search commands are **left completely alone** — long runners like `tail -f`/`watch`/foreground
    servers keep going.
+4. **Read-only fence for fenced processes (hard, opt-in)**: when `PI_BASH_GUARD_MODE` is set, every
+   `bash`/`powershell` call is judged **before it runs** against a read-only allow list, and anything
+   that writes, deletes, installs, builds, tests, or reaches the network is blocked with a
+   `[BASH READ-ONLY FENCE]` reason that names the way out (the `read` tool, the session-recall CLI).
+   The allow list is a small set of readers: `rg`/`grep`/`sed -n`/`head`/`tail`/`wc`/`ls`/`stat`/
+   `file`/`sort`/`uniq`/`cut`/`tr`/`diff`/`jq`, read-only `git` subcommands (`log`/`show`/`diff`/
+   `status`/`blame`/`rev-parse`/...), read-only `tmux` inspection (`capture-pane`/`has-session`/`ls`),
+   and `bun <script> ...` / `pi-vcc ...` so a recall CLI keeps working. Output redirects (`>`, `>>`,
+   `2>&1`) are blocked everywhere; so are commands that hand off to another program (wrappers like
+   `sudo`/`env`/`xargs`, `rg --pre`, interpreters) and flags that never return (`tail -f`, `ls -R`).
+   An unparsable command (unclosed quote) or an unknown mode value fails **closed**. The fence matches
+   literal command names only — it does not expand `${VAR}` or aliases, so a poisoned environment is
+   out of its scope. The mode itself comes from the env var and is not writable from the session, so a
+   fenced process can't switch it off (the `[READ-ONLY SESSION]` notice says so, and the status bar
+   shows `🛡 read-only`). See `src/read-only.ts`.
 
    A real incident: `grep -rln ... ~/.pi ~/Projects ~/ensoai | grep -v ...` ran for **5148 seconds**
    with no timeout; now such commands are pulled to 5 minutes.
@@ -158,8 +174,10 @@ Env vars act as **new-session seed values** (a saved session config wins):
 | `PI_BASH_GUARD_PREVIEW_HEAD` | `20` | head preview lines |
 | `PI_BASH_GUARD_PREVIEW_TAIL` | `15` | tail preview lines (on success) |
 | `PI_BASH_GUARD_ERROR_TAIL` | `25` | tail preview lines (on failure) |
+| `PI_BASH_GUARD_MODE` | — | not a seed value: read from the env on **every** tool call. `advisor` = read-only fence; any other non-empty value = block all bash (fail closed). Set by the sub-agent launcher (see `pi-extension-tmux-subagent`), never persisted into the session |
 
-Status bar: shows `🛡 bash-guard` when enabled, `🛡 bash-guard ×N` after interceptions.
+Status bar: shows `🛡 bash-guard` when enabled, `🛡 bash-guard ×N` after interceptions. In a fenced
+process it shows `🛡 read-only` and `🛡 read-only ×N` (fence blocks only).
 
 ## Design trade-offs
 
@@ -204,6 +222,7 @@ src/analyze.ts        size checks, built-in footer removal, preview trim, repeat
 src/classify.ts       command classes: process output / build-test / valuable payload (strict allowlist, word list from claude-code)
 src/suggest.ts        command heuristics -> rewrite hints
 src/scan-guard.ts     scan parsing: quote-aware segment split + tokenizer + find/grep/rg/du/tree root check
+src/read-only.ts      the read-only allow list: judge a command, and read the fence mode from the env
 src/timeout-guard.ts  5-minute timeout cap for search commands (pure helper)
 src/guard-message.ts  build the final guard text
 tests/                pure helpers + end-to-end (mockPi) cases
