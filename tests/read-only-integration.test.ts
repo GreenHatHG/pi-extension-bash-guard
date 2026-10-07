@@ -57,6 +57,9 @@ describe("read-only fence wiring", () => {
 			"sed -n '1,60p' src/index.ts",
 			"rg -l -m 5 advisor src/",
 			"git log --oneline -n 20",
+			"cd /Users/x/Projects/pi-watchdog && git status --short | head -n 20",
+			'grep -rn x src/ -l; echo "exit=$?"',
+			"git tag --contains HEAD",
 			"bun /Users/jooooody/Projects/pi-vcc/cli/main.ts recall /tmp/s.jsonl keyword",
 			"tmux -L pi-sub capture-pane -t s -p | tail -30",
 		]) {
@@ -65,12 +68,23 @@ describe("read-only fence wiring", () => {
 		}
 	});
 
-	test("advisor mode: redirects are blocked", async () => {
+	test("advisor mode: redirects that write a file are blocked", async () => {
 		process.env[MODE_ENV] = "advisor";
 		const rt = await setup();
-		const result = await callBash(rt, "git log > /tmp/out.txt");
-		expect(result?.block).toBe(true);
-		expect(result?.reason).toContain("redirect");
+		for (const cmd of ["git log > /tmp/out.txt", "pnpm test 2> /tmp/err"]) {
+			const result = await callBash(rt, cmd);
+			expect(result?.block, cmd).toBe(true);
+			expect(result?.reason, cmd).toContain("redirect");
+		}
+	});
+
+	test("advisor mode: hushing stderr still runs", async () => {
+		process.env[MODE_ENV] = "advisor";
+		const rt = await setup();
+		for (const cmd of ["ls /nope 2>/dev/null | head -3", "rg -n x src/ 2>&1 | head -3"]) {
+			const result = await callBash(rt, cmd);
+			expect(result?.block, cmd).toBeUndefined();
+		}
 	});
 
 	test("an unknown mode fails closed: all bash blocked", async () => {

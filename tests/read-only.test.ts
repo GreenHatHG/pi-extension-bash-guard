@@ -82,25 +82,163 @@ describe("judgeReadOnlyCommand: allowed", () => {
 		expect(ok("rg -l foo src/ | head -n 5")).toBe(true);
 		expect(ok("git diff --stat; git status --short")).toBe(true);
 	});
+	test("date/hostname print, but lose the day they are given something to set", () => {
+		for (const cmd of [
+			"date",
+			"date +%s",
+			"date -u",
+			"date '+%Y-%m-%d'",
+			"date -r /etc/hosts",
+			"date -v-1d +%Y",
+			"hostname",
+			"hostname -s",
+			"hostname -f",
+		]) {
+			expect(ok(cmd), cmd).toBe(true);
+		}
+		for (const cmd of [
+			"date 0101120099", // a bare operand is BSD's set-the-clock form
+			"date -s '2020-01-01'",
+			"hostname evil.example",
+			"hostname -F /tmp/h",
+		]) {
+			expect(ok(cmd), cmd).toBe(false);
+		}
+	});
+	test("plain shell builtins and pipelines", () => {
+		// Real advisor commands: the extra `echo`/`cd` segments were the bulk of the false positives
+		for (const cmd of [
+			"cd /Users/x/Projects/pi-watchdog && git status --short | head -n 20",
+			'grep -rn x src/ --include="*.ts" -l; echo "exit=$?"',
+			"grep -n a f.ts | head; echo ---; grep -n b f.ts | head",
+			"true",
+			"pwd",
+			"uname -s",
+			"which bun",
+			"test -f /etc/hosts",
+			"rg -l foo src/ | xargs wc -l",
+		]) {
+			expect(ok(cmd), cmd).toBe(true);
+		}
+	});
+	test("find/tree are readers only without their exec/write flags", () => {
+		expect(ok("find /x/packages -name '*bash*' -not -path '*node_modules*' | head")).toBe(true);
+		expect(ok("tree -L 2 src")).toBe(true);
+		for (const cmd of [
+			"find . -name '*.ts' -exec rm {} ;",
+			"find . -name '*.ts' -delete",
+			"find . -name '*.ts' -fls /tmp/out",
+			"tree -o /tmp/out.txt",
+			"sort -o /tmp/out.txt in.txt",
+		]) {
+			expect(ok(cmd), cmd).toBe(false);
+		}
+	});
+	test("command substitution is judged as its own command, and no longer breaks the outer parse", () => {
+		// The substitution's `|` used to split the outer command, leaving `p" f` as an unknown segment
+		expect(ok('sed -n "$(grep -n x f.ts | cut -d: -f1)p" f.ts')).toBe(true);
+		expect(ok('ls -dt /tmp/x | head -5; echo "count: $(ls -d /tmp/x | wc -l)"')).toBe(true);
+		// ...but it stays a real check: the substitution runs code like any other command
+		expect(ok('sed -n "$(pnpm test)" f.ts')).toBe(false);
+		expect(ok("grep x `rm -rf /tmp/x`")).toBe(false);
+	});
+	test("xargs is judged by the command it runs, not waved through", () => {
+		expect(ok("rg -l foo src/ | xargs wc -l")).toBe(true);
+		expect(ok("rg -l foo src/ | xargs -0 wc -l")).toBe(true);
+		expect(ok("rg -l foo src/ | xargs -n1 wc -l")).toBe(true);
+		expect(ok("rg -l foo src/ | xargs -I{} wc -l {}")).toBe(true);
+		expect(ok("printf '' | xargs -r wc")).toBe(true);
+		for (const cmd of [
+			"find . -type f -print0 | xargs -0 rm",
+			"rg -l foo src/ | xargs pnpm test",
+			"rg -l foo src/ | xargs -a list.txt rm",
+			"rg -l foo src/ | xargs -alist.txt wc",
+			"rg -l foo src/ | xargs",
+			// an xargs flag this code has not seen changes what xargs runs; fail closed on it
+			"rg -l foo src/ | xargs --some-future-flag wc",
+			"rg -l foo src/ | xargs -0foo wc",
+		]) {
+			expect(ok(cmd), cmd).toBe(false);
+		}
+	});
+	test("shell control flow is refused by name, not by accident", () => {
+		// The body of `for f in x; do <body>; done` is split off before it is judged, so the construct
+		// is refused as a whole; if this ever starts passing because `do` got allowlisted, loop bodies
+		// would run unjudged.
+		for (const cmd of ["for f in a b; do echo $f; done", "while true; do ls; done", "if [ -f x ]; then ls; fi"]) {
+			expect(ok(cmd), cmd).toBe(false);
+			expect(reason(cmd), cmd).toContain("control flow");
+		}
+	});
+	test("read-only git subcommands that used to be blocked", () => {
+		for (const cmd of [
+			"git tag --contains 0cf4828 | head -5",
+			"git reflog show advisor-mode | head -20",
+			"git merge-base HEAD MERGE_HEAD",
+			"git worktree list",
+			"git show-ref --heads",
+			"git for-each-ref --format='%(refname)' refs/heads",
+		]) {
+			expect(ok(cmd), cmd).toBe(true);
+		}
+		expect(ok("git worktree add /tmp/wt")).toBe(false);
+	});
+	test("git -p starts a pager, so it stays denied in the global position only", () => {
+		expect(ok("git -p log")).toBe(false);
+		expect(ok("git --paginate log")).toBe(false);
+		// `-p` after the subcommand is that subcommand's own flag (cat-file -p = pretty print)
+		expect(ok("git cat-file -p HEAD:src/index.ts")).toBe(true);
+	});
 	test("empty command is a no-op, not a denial", () => {
 		expect(ok("")).toBe(true);
 		expect(ok("   ")).toBe(true);
 	});
+	test("cleanup verbs stay denied even though the fence now allows their read-only neighbours", () => {
+		for (const cmd of ["cat f", "tee out", "kill 1", "pnpm test"]) {
+			expect(ok(cmd), cmd).toBe(false);
+		}
+	});
 });
 
 describe("judgeReadOnlyCommand: denied", () => {
-	test("write redirects, including fd merge and here-doc", () => {
+	test("write redirects, including a redirect that only looks like silencing", () => {
 		for (const cmd of [
 			"echo hi > /tmp/x",
 			"git log >> out.txt",
-			"rg foo src/ 2>&1",
-			"cat >> /tmp/x <<'EOF'",
 			"sed -n '1,5p' f > /tmp/y",
+			// the shapes people reach for when they mean "hush": a real target is still a write
+			"rg foo src/ 2> /tmp/err",
+			"rg foo src/ 2>&1 > /tmp/x",
+			// `<>` opens for read+write and creates the file; process substitution runs a command
+			"sed -n '1p' <>/tmp/x",
+			"sed -n '1p' <(pnpm test)",
+			"sed -n '1p' >(pnpm test)",
+			"ls >&out.txt",
 		]) {
 			expect(ok(cmd), cmd).toBe(false);
-			expect(reason(cmd), cmd).toContain("redirect");
 		}
+		// every denial names the rewrite — one of them does not use the word "redirect"
+		expect(reason("ls >&out.txt")).toContain("2>&1");
+		expect(reason("sed -n '1p' <>/tmp/x")).toContain("writing");
+		expect(ok("cat >> /tmp/x <<'EOF'")).toBe(false);
 		expect(ok("cat <<'EOF'")).toBe(false); // a bare here-doc is denied by the command rule, not the redirect one
+	});
+	test("discarding a stream or merging it into stdout is not a write", () => {
+		// Each of these is the reflex form in a read-only one-liner; blocking them costs a turn and writes nothing.
+		for (const cmd of [
+			"ls /nope 2>/dev/null",
+			"rg -n x . 2>/dev/null | head -5",
+			"rg -c foo src/ 2>&1 | head -3",
+			"ls src/ > /dev/null",
+			// a numeric target is descriptor duplication, not a file: `2>&2` is a no-op, `2>&1` merges
+			"rg foo src/ 2>&2",
+			"bun /x/main.ts recall f k 2>/dev/null",
+			"sed -n '1p' /etc/hosts 2>/dev/null; echo ---",
+		]) {
+			expect(ok(cmd), cmd).toBe(true);
+		}
+		// `2>&1` inside a substitution must be allowed too, or a whole class of one-liners dies on it
+		expect(ok('echo "count: $(ls -d /tmp/pi-sub-* 2>/dev/null | wc -l)"')).toBe(true);
 	});
 	test("reading stdin is not a write redirect", () => {
 		expect(ok("jq '.x' < data.json")).toBe(true);

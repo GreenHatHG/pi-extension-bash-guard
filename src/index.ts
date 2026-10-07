@@ -63,11 +63,12 @@ export function buildDisciplineText(cfg: GuardConfig, readOnly = false): string 
 				"",
 				"[READ-ONLY SESSION] This session is fenced to read-only bash: every command is checked before it runs, and " +
 					"anything that writes, deletes, installs, builds, tests, or reaches the network is blocked with a " +
-					"`[BASH READ-ONLY FENCE]` reason. Read files with the `read` tool; use the recall CLI for session history; " +
-					"keep shell checks to bounded, read-only commands (`rg -l`, `sed -n`, `head`, `tail`, `wc`, `git log/show/diff`, `tmux capture-pane`). " +
-					"Two things that look harmless are blocked on purpose: anything that hands the command to another " +
-					"program (a wrapper like `sudo`/`env`/`xargs`, `rg --pre`, an interpreter), and `enclave`/`unboxexec` " +
-					"(a sandbox privilege channel, not a read-only command).",
+					"`[BASH READ-ONLY FENCE]` reason (the reason names the way out). Read files with the `read` tool; use the recall CLI " +
+					"for session history; keep shell checks to bounded, read-only commands (`rg -l`, `sed -n`, `head`, `tail`, `wc`, " +
+					"`git log/show/diff`, `tmux capture-pane`). Redirects that discard a stream (`2>/dev/null`, `2>&1`) are fine — " +
+					"writing to a real file is not. A few things that look harmless are blocked on purpose: anything that hands " +
+					"the command to another program (a wrapper like `sudo`/`env`, `rg --pre`, `find -exec`, an interpreter), and " +
+					"`enclave`/`unboxexec` (a sandbox privilege channel, not a read-only command).",
 			]
 		: [];
 	return [

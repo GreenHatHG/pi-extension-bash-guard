@@ -1,5 +1,11 @@
 import { describe, expect, test } from "vitest";
-import { detectBlockedScan, stripRedirections, tokenizeSegment } from "../src/scan-guard";
+import {
+	detectBlockedScan,
+	extractForWordLists,
+	splitCommandSubstitutions,
+	stripRedirections,
+	tokenizeSegment,
+} from "../src/scan-guard";
 
 const HOME = "/Users/tester";
 const opts = { home: HOME };
@@ -24,6 +30,33 @@ describe("tokenizeSegment", () => {
 
 	test("Single quotes keep their content literal", () => {
 		expect(tokenizeSegment("rg '$HOME' -g '*.ts'")).toEqual(["rg", "$HOME", "-g", "*.ts"]);
+	});
+});
+
+describe("splitCommandSubstitutions", () => {
+	test("pulls `$(...)` out and leaves a marker that cannot be split on", () => {
+		const { text, nested } = splitCommandSubstitutions('sed -n "$(grep -n x f.ts | cut -d: -f1)p" f.ts');
+		expect(nested).toEqual(["grep -n x f.ts | cut -d: -f1"]);
+		expect(text).not.toContain("|");
+		expect(text).toContain('p" f.ts'); // the tail of the outer command survives intact
+	});
+	test("backticks are pulled out too, including inside double quotes", () => {
+		expect(splitCommandSubstitutions("grep x `ls /tmp`").nested).toEqual(["ls /tmp"]);
+		expect(splitCommandSubstitutions('echo "n: `ls | wc -l`"').nested).toEqual(["ls | wc -l"]);
+	});
+	test("a substitution inside single quotes is literal text, not code", () => {
+		expect(splitCommandSubstitutions("rg '$(rm -rf /)' src/").nested).toEqual([]);
+	});
+});
+
+describe("detectBlockedScan — `for ... in <list>` word lists", () => {
+	test("the substitution inside a for-list is scanned", () => {
+		expect(hit("for f in $(grep -rl x ~); do echo $f; done")).toBe("grep ~ home");
+		expect(hit("for f in $(rg -l x /); do echo $f; done")).toBe("rg / root");
+	});
+	test("a literal word list is not a scan", () => {
+		expect(extractForWordLists("for f in a b c; do echo $f; done")).toEqual(["a b c"]);
+		expect(hit("for f in a b c; do echo $f; done")).toBeNull();
 	});
 });
 

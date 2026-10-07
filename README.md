@@ -33,11 +33,25 @@ Four things, three hard and one soft:
    that writes, deletes, installs, builds, tests, or reaches the network is blocked with a
    `[BASH READ-ONLY FENCE]` reason that names the way out (the `read` tool, the session-recall CLI).
    The allow list is a small set of readers: `rg`/`grep`/`sed -n`/`head`/`tail`/`wc`/`ls`/`stat`/
-   `file`/`sort`/`uniq`/`cut`/`tr`/`diff`/`jq`, read-only `git` subcommands (`log`/`show`/`diff`/
-   `status`/`blame`/`rev-parse`/...), read-only `tmux` inspection (`capture-pane`/`has-session`/`ls`),
-   and `bun <script> ...` / `pi-vcc ...` so a recall CLI keeps working. Output redirects (`>`, `>>`,
-   `2>&1`) are blocked everywhere; so are commands that hand off to another program (wrappers like
-   `sudo`/`env`/`xargs`, `rg --pre`, interpreters) and flags that never return (`tail -f`, `ls -R`).
+   `file`/`sort`/`uniq`/`cut`/`tr`/`diff`/`jq`/`find`/`tree`/`which`/`pwd`, read-only shell builtins
+   (`echo`/`printf`/`cd`/`true`), `date`/`hostname` *only while they are printing* (`date +%s` is
+   allowed; `date 0101120099` or `hostname evil.example` sets machine state and is refused), read-only
+   `git` subcommands (`log`/`show`/`diff`/`status`/`blame`/`rev-parse`/`tag`/`reflog`/`merge-base`/...),
+   read-only `tmux` inspection (`capture-pane`/`has-session`/`ls`), and `bun <script> ...` / `pi-vcc ...`
+   so a recall CLI keeps working.
+   `... | xargs <reader>` is judged by the command xargs runs, not skipped wholesale; an xargs flag
+   the fence does not recognise is refused instead of assumed harmless.
+
+   **Redirects** are judged one by one instead of "any `>` is a write": discarding a stream
+   (`2>/dev/null`, `>/dev/null`, or merging stderr with `2>&1`) writes nothing and is allowed, while
+   every other target stays blocked (`2> /tmp/x`, `2>&2`, `> file`). Reading stdin (`<`) is allowed.
+   So are most commands that hand off to another program (wrappers like `sudo`/`env`, `rg --pre`,
+   interpreters, `find -exec`/`-delete`, `sort -o`) and flags that never return (`tail -f`, `ls -R`).
+   `$(...)` and backticks are judged as commands of their own **and** masked out of the outer text, so
+   a substitution neither hides a write nor breaks the outer parse
+   (`sed -n "$(grep -n x f | cut -d: -f1)p" f` used to fail on the `|` inside the substitution).
+   Loops and conditionals (`for`/`while`/`if`/`do`/...) are refused outright: their body is split off
+   before it can be judged, so half-checking them would be worse than saying no.
    An unparsable command (unclosed quote) or an unknown mode value fails **closed**. The fence matches
    literal command names only — it does not expand `${VAR}` or aliases, so a poisoned environment is
    out of its scope. The mode itself comes from the env var and is not writable from the session, so a

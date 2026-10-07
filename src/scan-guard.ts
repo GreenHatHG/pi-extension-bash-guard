@@ -492,39 +492,48 @@ function plainRoots(args: string[], valueFlags: Set<string>): string[] {
 	return roots;
 }
 
-/** Pull nested commands out of `$()` and backticks, so shell substitution can't dodge the scan block. */
-function extractNestedCommands(command: string): string[] {
+/**
+ * Placeholder a command substitution is replaced with: a plain word with no shell syntax in it, so
+ * splitting the outer command on `;&|` can no longer see the separators that live inside the
+ * substitution.
+ */
+export const SUBSTITUTION_MARKER = "__pi_substitution__";
+
+export interface CommandSubstitutions {
+	/** The command with every substitution replaced by SUBSTITUTION_MARKER (quotes preserved). */
+	text: string;
+	/** The inner command text of each substitution, in order of appearance. */
+	nested: string[];
+}
+
+/**
+ * Replace `$(...)` and backticks with SUBSTITUTION_MARKER, collecting what they run.
+ *
+ * Both forms execute their contents, so they are pulled out and judged as commands of their own
+ * (see read-only.ts), and replacing them here keeps the *outer* command parseable: without it,
+ * `sed -n "$(grep -n x f | cut -d: -f1)p" f` is split on the `|` inside the substitution and the
+ * trailing `p" f` becomes an unknown segment.
+ *
+ * Substitutions inside single quotes are literal text and are left alone, so a stray `$(` there still
+ * fails closed downstream instead of being silently treated as code.
+ */
+export function splitCommandSubstitutions(command: string): CommandSubstitutions {
+	let text = "";
 	const nested: string[] = [];
 	let quote: "'" | '"' | null = null;
 	for (let i = 0; i < command.length; i++) {
 		const ch = command[i];
-		if (ch === "\\") {
+		if (ch === "\\" && quote !== "'") {
+			text += ch + (command[i + 1] ?? "");
 			i++;
 			continue;
 		}
 		if (quote === "'") {
+			text += ch;
 			if (ch === "'") quote = null;
 			continue;
 		}
-		if (quote === '"') {
-			if (ch === '"') quote = null;
-			if (ch === "$" && command[i + 1] === "(") {
-				const end = findCommandSubstitutionEnd(command, i + 2);
-				if (end !== -1) {
-					nested.push(command.slice(i + 2, end));
-					i = end;
-				}
-			}
-			continue;
-		}
-		if (ch === "'") {
-			quote = ch;
-			continue;
-		}
-		if (ch === '"') {
-			quote = ch;
-			continue;
-		}
+		// Inside double quotes `$(...)` and backticks still execute, so they are collected here too.
 		if (ch === "`") {
 			let end = i + 1;
 			while (end < command.length) {
@@ -537,19 +546,43 @@ function extractNestedCommands(command: string): string[] {
 			}
 			if (end < command.length) {
 				nested.push(command.slice(i + 1, end));
+				text += SUBSTITUTION_MARKER;
 				i = end;
+				continue;
 			}
-			continue;
 		}
 		if (ch === "$" && command[i + 1] === "(") {
 			const end = findCommandSubstitutionEnd(command, i + 2);
 			if (end !== -1) {
 				nested.push(command.slice(i + 2, end));
+				text += SUBSTITUTION_MARKER;
 				i = end;
+				continue;
 			}
 		}
+		if (ch === "'" || ch === '"') quote = quote === null ? ch : quote;
+		text += ch;
 	}
-	return nested;
+	return { text, nested };
+}
+
+/** What each substitution runs, in order of appearance (nested ones are judged recursively later). */
+export function extractNestedCommands(command: string): string[] {
+	return splitCommandSubstitutions(command).nested;
+}
+
+/**
+ * Word lists of `for <name> in <words>; do ... done` loops.
+ *
+ * `for f in $(grep -l pattern ~/.pi/agent/sessions); do ...` is an unbounded scan that no single
+ * segment shows: the word list sits between `in` and `do`, where the segment splitter never looks.
+ * The body needs no handling here — read-only.ts judges it as its own command.
+ */
+const FOR_IN = /\bfor\s+[A-Za-z_]\w*\s+in\s+([\s\S]*?)(?=;|\n|\bdo\b)/g;
+export function extractForWordLists(command: string): string[] {
+	const out: string[] = [];
+	for (const match of command.matchAll(FOR_IN)) out.push(match[1]);
+	return out;
 }
 
 function findCommandSubstitutionEnd(command: string, start: number): number {
@@ -594,6 +627,7 @@ export function parseScanCommands(command: string, depth = 0): ParsedScan[] {
 	const out: ParsedScan[] = [];
 	if (!command || depth > 8) return out;
 	for (const nested of extractNestedCommands(command)) out.push(...parseScanCommands(nested, depth + 1));
+	for (const words of extractForWordLists(command)) out.push(...parseScanCommands(words, depth + 1));
 	for (const segment of splitSegments(command)) {
 		const tokens = stripWrappers(tokenizeSegment(stripRedirections(segment)));
 		if (tokens.length === 0) continue;
