@@ -10,7 +10,7 @@ without **blocking the payload the model really needs**.
 
 ## Behavior
 
-Four things, three hard and one soft:
+Five things, four hard and two soft (the slice guard has both):
 
 1. **Set the rules up front (soft)**: on the session's first agent run, inject a `[BASH OUTPUT DISCIPLINE]`
    note (`display: false`, model context only, not the TUI) that tells the model how to bound searches /
@@ -28,6 +28,24 @@ Four things, three hard and one soft:
    place to **300**; a smaller model-set value is respected (300 is a ceiling, not an override).
    Non-search commands are **left completely alone** — long runners like `tail -f`/`watch`/foreground
    servers keep going.
+3.5. **Catch slice-read death loops (hard + soft)**: at `tool_call`, count small `sed -n 'A,Bp'`
+   slice reads per file. Two breakers, both with a way out:
+   - **Volume breaker**: 80 slice reads of one file in a session → further bash slice reads of that
+     file are blocked for the session (the `read` tool with offset/limit is not). This catches the
+     slow burn where every window is different — a real runaway session did 1242 reads of one file
+     over 8 hours and never finished; normal sessions top out at 53.
+   - **Loop breaker**: 6 fast re-reads (same exact range, 15s–10min apart) of one file inside a
+     30-minute window → block that call, with "the content is already in your context — work from
+     it, or tell the user where you are stuck". This catches the "tweak → re-read the same lines"
+     loop that never reaches the volume cap.
+   - **Soft nudge**: at 20 slice reads of one file, a one-line hint rides on the result once
+     ("read a big block once with the `read` tool instead of more slices").
+
+   Thresholds come from replaying every recorded session on this machine (992 sessions, ~25k slice
+   reads): the two breakers fire on zero normal sessions and catch both known runaway sessions
+   (at 18:56 of an 8-hour session / 12 minutes into a tweak loop). Only `sed -n` counts toward the
+   hard rules — `head`/`tail` feeds the soft counter only, because `tail -f` log following is a
+   highly legitimate pattern the replay never validated against.
 4. **Read-only fence for fenced processes (hard, opt-in)**: when `PI_BASH_GUARD_MODE` is set, every
    `bash`/`powershell` call is judged **before it runs** against a read-only allow list, and anything
    that writes, deletes, installs, builds, tests, or reaches the network is blocked with a
@@ -229,6 +247,14 @@ process it shows `🛡 read-only` and `🛡 read-only ×N` (fence blocks only).
   A `tool_result` content patch is enough.
 - **Why not cover `read`/`grep`/`find`**: those built-ins already have structured truncation and
   offset/limit/head_limit params, so v1 doesn't handle them again.
+- **Why the slice guard only watches `sed -n`**: the replay data that set the thresholds only
+  validated `sed -n` patterns; `head`/`tail` (2.5x more common) include highly legitimate forms like
+  log following and build-tail peeks. They still feed the soft counter, so a session that drifts
+  into slice-reading gets the early hint regardless of which tool it uses.
+- **Why block instead of nudge harder**: a runaway loop burns hours per incident; a false positive
+  costs one tool switch (the block reason points at `read`, which is never blocked for that file).
+  With the replay data showing a 2x gap between normal (52 reads) and runaway (1242), the block's
+  error direction is cheap.
 - **Why inject a search `timeout` instead of blocking**: `tool_call`'s `input` is mutable, so pulling
   `timeout` to 300 seconds takes effect right away with no extra "block → resend" round trip; and it's
   a ceiling — a smaller model-set budget is used as is. The cost is the model may not know it was

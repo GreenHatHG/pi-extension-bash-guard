@@ -22,6 +22,7 @@ import { CONFIG_CUSTOM_TYPE, type GuardConfig, loadEnvConfig, parseCommandArgs, 
 import { buildGuardMessage } from "./guard-message";
 import { judgeReadOnlyCommand, MODE_ENV, READ_ONLY_MODE, readOnlyMode } from "./read-only";
 import { detectBlockedScan } from "./scan-guard";
+import { MAX_TRACKED_FILES, newFileSliceState, parseSlices, recordSlice } from "./slice-guard";
 import { isSearchCommand, SEARCH_TIMEOUT_SECONDS, searchTimeoutInjection } from "./timeout-guard";
 
 /** Status bar key. */
@@ -143,6 +144,8 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	let framingDelivered = false;
 	let escalationWarningDelivered = false;
 	const guardedCommands = new Set<string>();
+	/** Per-file slice-read counters (see slice-guard.ts); keyed by normalized path. */
+	const sliceStates = new Map<string, ReturnType<typeof newFileSliceState>>();
 	const tempDirs = new Set<string>();
 	const tempStorage: TempStorage = { nextFile: 0 };
 
@@ -152,6 +155,27 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		} catch {
 			// Save failure isn't fatal: config is still right in this process, just lost on resume
 		}
+	}
+
+	/**
+	 * Soft nudge text for a finished slice-read call, or undefined when none applies.
+	 *
+	 * `tool_result` has no clean way to know which file the call read, so the nudge key is recomputed
+	 * from the command itself: any file in this command that has crossed the nudge threshold counts.
+	 * Hard blocks already happened at `tool_call`; this is only the gentler early hint.
+	 */
+	function sliceNudgeText(command: string, toolName: string): string | undefined {
+		if (toolName !== "bash") return undefined;
+		const slices = parseSlices(command);
+		if (slices.length === 0) return undefined;
+		const nowMs = Date.now();
+		for (const slice of slices) {
+			const state = sliceStates.get(slice.file);
+			if (!state) continue;
+			const verdict = recordSlice(state, slice, nowMs);
+			if (verdict.kind === "nudge") return verdict.message;
+		}
+		return undefined;
 	}
 
 	function updateStatus(ctx: ExtensionContext | undefined): void {
@@ -181,7 +205,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		tempStorage.dir = undefined;
 		tempStorage.dirPromise = undefined;
 		tempStorage.nextFile = 0;
-		guardedCommands.clear();
+		sliceStates.clear();
 		const branch = ctx.sessionManager?.getBranch?.() ?? [];
 		const persisted = readPersistedConfig(branch);
 		cfg = persisted ?? loadEnvConfig();
@@ -250,6 +274,27 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		if (!cfg.enabled) return;
 		if (command === "") return;
 
+		// Slice-read loop guard: count small `sed -n` reads per file; block when the volume cap or
+		// the fast-repeat cap trips. Runs before the scan block so a blocked loop can't waste a scan.
+		const slices = parseSlices(command);
+		if (slices.length > 0) {
+			if (sliceStates.size >= MAX_TRACKED_FILES) sliceStates.clear();
+			const nowMs = Date.now();
+			for (const slice of slices) {
+				let state = sliceStates.get(slice.file);
+				if (!state) {
+					state = newFileSliceState();
+					sliceStates.set(slice.file, state);
+				}
+				const verdict = recordSlice(state, slice, nowMs);
+				if (verdict.kind === "block") {
+					fenceHits++;
+					updateStatus(ctx);
+					return { block: true, reason: verdict.message };
+				}
+			}
+		}
+
 		if (cfg.scanBlock) {
 			const hit = detectBlockedScan(command, { home: homedir() });
 			if (hit) {
@@ -311,6 +356,11 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 			// Timeout errors are usually tiny, so the size limit misses them; only our silently-capped search commands need the hint.
 			if (event.isError && TIMEOUT_SIGNAL.test(text) && isSearchCommand(command)) {
 				return { content: [{ type: "text" as const, text: `${text}\n\n${TIMEOUT_HINT}` }], details: event.details };
+			}
+			// Slice-loop soft nudge: ride along on any result once the read count gets high.
+			const nudge = sliceNudgeText(command, event.toolName);
+			if (nudge) {
+				return { content: [{ type: "text" as const, text: `${text}\n\n${nudge}` }], details: event.details };
 			}
 			return;
 		}
