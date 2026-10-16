@@ -14,7 +14,7 @@
  *   model wants, so wide limit, no lecturing, no escalation count.
  */
 
-import { basename, splitSegments, stripRedirections, stripWrappers, tokenizeSegment } from "./scan-guard";
+import { ASSIGNMENT, basename, splitSegments, stripRedirections, stripWrappers, tokenizeSegment } from "./scan-guard";
 
 /** Command bucket. */
 export type CommandClass = "exhaust" | "build-test" | "unknown";
@@ -122,6 +122,18 @@ const BUILD_COMMANDS = new Set([
 /** Kind of one command segment (wrappers and redirections already stripped). */
 type SegmentKind = "search" | "read" | "build" | "other";
 
+/**
+ * A leading `FOO=bar` sets a variable, it doesn't run a command, so it must not sink the whole
+ * command to `unknown`. Without this, `f=x; rg foo $f` looked like "rg plus an unknown command"
+ * and got the wide payload limit instead of the tight process-output one.
+ * (Confirmed: `f=x; rg foo $f | head` was 30KB, the same command without the assignment was 8KB.)
+ */
+function dropLeadingAssignments(tokens: string[]): string[] {
+	let i = 0;
+	while (i < tokens.length && ASSIGNMENT.test(tokens[i])) i++;
+	return i === 0 ? tokens : tokens.slice(i);
+}
+
 /** git global flags that eat the next token as their value. */
 const GIT_GLOBAL_VALUE_FLAGS = new Set([
 	"-C",
@@ -167,7 +179,7 @@ function segmentKind(tokens: string[]): SegmentKind {
 export function classifyCommand(command: string): CommandClass {
 	const kinds: SegmentKind[] = [];
 	for (const segment of splitSegments(command)) {
-		const raw = tokenizeSegment(stripRedirections(segment));
+		const raw = dropLeadingAssignments(tokenizeSegment(stripRedirections(segment)));
 		const stripped = stripWrappers(raw);
 		// `env` / `xargs` are both wrapper and command: fall back to raw tokens when stripping
 		// leaves nothing, so a lone `env` dump isn't treated as an empty segment.

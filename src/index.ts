@@ -310,7 +310,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		if (!assessment.exceeded) {
 			// Timeout errors are usually tiny, so the size limit misses them; only our silently-capped search commands need the hint.
 			if (event.isError && TIMEOUT_SIGNAL.test(text) && isSearchCommand(command)) {
-				return { content: [{ type: "text" as const, text: `${text}\n\n${TIMEOUT_HINT}` }] };
+				return { content: [{ type: "text" as const, text: `${text}\n\n${TIMEOUT_HINT}` }], details: event.details };
 			}
 			return;
 		}
@@ -348,7 +348,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 			repeatCommand,
 		});
 
-		return { content: [{ type: "text" as const, text: guardText }] };
+		return { content: [{ type: "text" as const, text: guardText }], details: event.details };
 	});
 
 	// ── /bash-guard config command ─────────────────────────────────────────────────

@@ -68,7 +68,7 @@ describe("tool_result interception", () => {
 		expect(text).toContain("[BASH OUTPUT GUARD]");
 		expect(text).toContain("Output withheld: 500 lines");
 		expect(text).toContain("Preview — first");
-		expect(text).toContain("lines omitted");
+		expect(text).toContain("lines skipped");
 		expect(text).toContain("Full output saved to:");
 		expect(text).toContain("pi-bash-guard-");
 		expect(text).toContain("Rewrite the command instead of repeating it");
@@ -122,6 +122,42 @@ describe("tool_result interception", () => {
 		});
 		const text = resultText(result);
 		expect(text).toContain("Output withheld: 10241 lines / 3.1MB");
+	});
+
+	test("Built-in truncation means the tail is all we have, so the preview is not labelled as a head", async () => {
+		const rt = await setup();
+		const keptTail = Array.from({ length: 40 }, (_, i) => `tail line ${i}`).join("\n");
+		const result = await rt.runToolResult({
+			text: `${keptTail}\n\n[Showing lines 9961-10000 of 10000. Full output: /tmp/builtin/full.txt]`,
+			command: "rg foo .",
+			details: {
+				truncation: { truncated: true, totalLines: 10000, totalBytes: 3_200_000 },
+				fullOutputPath: "/tmp/builtin/full.txt",
+			},
+		});
+		const text = resultText(result);
+		// The text we hold is a tail, so calling any of it "first 20 lines" would be a lie.
+		expect(text).not.toContain("Preview — first");
+		expect(text).toContain("Preview — showing lines 9986-10000 of 10000:");
+		expect(text).toContain("... [9985 lines skipped] ...");
+	});
+
+	test("Details are passed back untouched, so the TUI keeps its full-output hint", async () => {
+		const rt = await setup();
+		const details = { truncation: { truncated: true }, fullOutputPath: "/tmp/builtin/out.txt" };
+		const result = await rt.runToolResult({ text: bigOutput(500), command: "rg foo .", details });
+		expect(result.details).toEqual(details);
+	});
+
+	test("Preview keeps a reachable head and a reachable tail when the command flooded", async () => {
+		const rt = await setup();
+		const many = Array.from({ length: 5000 }, (_, i) => `line ${i} ${"x".repeat(60)}`).join("\n");
+		const text = resultText(await rt.runToolResult({ text: many, command: "rg foo ." }));
+		expect(text).toContain("line 0 ");
+		expect(text).toContain("line 4999 ");
+		expect(text).toContain("... [4965 lines skipped] ...");
+		// The skip note has to stay inside the message budget.
+		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(8 * 1024);
 	});
 
 	test("Repeating the same command says it was already intercepted", async () => {

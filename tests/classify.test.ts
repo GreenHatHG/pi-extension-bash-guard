@@ -68,6 +68,15 @@ describe("classifyCommand", () => {
 		expect(classifyCommand("rg -n foo . > /tmp/out.txt")).toBe("exhaust");
 	});
 
+	test("A leading assignment is setting a variable, not an unknown command", () => {
+		// Real case: `f=chunk.js; rg -n 'x|y' $f | head -20` was 30KB, because `f=...` counted as a command.
+		expect(classifyCommand("f=/tmp/chunk.js; rg -n 'a|b' $f | head -20")).toBe("exhaust");
+		expect(classifyCommand("f=/tmp/chunk.js; rg -n foo $f")).toBe("exhaust");
+		expect(classifyCommand("f=/tmp/x.js\nrg -n foo $f | head -20")).toBe("exhaust");
+		expect(classifyCommand("A=1 B=2 rg foo .")).toBe("exhaust");
+		expect(classifyCommand("rg foo . && FOO=bar python x.py")).toBe("unknown");
+	});
+
 	test("Absolute-path calls (/usr/bin/grep) are recognized", () => {
 		expect(classifyCommand("/usr/bin/rg foo .")).toBe("exhaust");
 	});

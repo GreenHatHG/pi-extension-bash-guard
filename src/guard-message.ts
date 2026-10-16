@@ -11,7 +11,7 @@
 
 import {
 	type Assessment,
-	buildPreview,
+	builtinTruncatedSource,
 	type CollapsedLine,
 	collapseRepeats,
 	describeLimit,
@@ -26,7 +26,7 @@ import { suggestRewrites } from "./suggest";
 /** Max signal lines to show. */
 const SIGNAL_LINE_LIMIT = 15;
 /** Max chars per line, so one giant line can't flood the screen. */
-const MAX_LINE_CHARS = 400;
+const MAX_LINE_CHARS = 240;
 /** Max bytes for the guard text; the real budget is also capped by the current output tier. */
 const MAX_MESSAGE_BYTES = 12 * 1024;
 
@@ -73,6 +73,46 @@ export function clipLine(line: string, max = MAX_LINE_CHARS): string {
 	return `${line.slice(0, max)}… [+${line.length - max} chars]`;
 }
 
+/** What the preview shows: a few lines from each end, and what the fold counted. */
+export interface ShownPreview {
+	headLines: string[];
+	keptLines: string[];
+	/** Lines that sit between the two ends and are not printed. */
+	hiddenLines: number;
+	/** Hidden lines that were identical to a shown line, so the header can say "repeats". */
+	foldedLines: number;
+}
+
+/**
+ * Pick the preview lines the way a CLI pager frames a file: a few from the start, a few from the end.
+ *
+ * `totalLines` is the real stream length (the built-in cap can make it bigger than the text we hold),
+ * so the hidden count still describes the whole command, not just the piece we got. Pass
+ * `headBudget: 0` when all we hold is a tail — then every shown line really is from the end.
+ */
+function buildShownPreview(text: string, totalLines: number, headBudget: number, tailBudget: number): ShownPreview {
+	const lines = text.split("\n");
+	const tailShown = Math.min(tailBudget, totalLines);
+	const headShown = Math.min(headBudget, Math.max(0, totalLines - tailShown), lines.length);
+	const headLines = lines.slice(0, headShown);
+	const keptLines = tailShown > 0 ? lines.slice(lines.length - tailShown) : [];
+	const hiddenLines = Math.max(0, totalLines - headShown - tailShown);
+
+	let foldedLines = 0;
+	if (hiddenLines > 0) {
+		const seen = new Set([...headLines, ...keptLines].map((line) => line.trim()));
+		for (let i = headShown; i < lines.length - tailShown; i++) {
+			if (seen.has(lines[i].trim())) foldedLines++;
+		}
+	}
+	return { headLines, keptLines, hiddenLines, foldedLines };
+}
+
+/** `3 lines` / `1 line` — the counts show up in every preview header. */
+function lineCount(n: number): string {
+	return `${n} line${n === 1 ? "" : "s"}`;
+}
+
 function renderCollapsed(lines: CollapsedLine[], indent: string): string[] {
 	return lines.map(({ line, count }) => `${indent}${clipLine(line)}${count > 1 ? `  (×${count})` : ""}`);
 }
@@ -96,13 +136,17 @@ export function buildGuardMessage(input: GuardMessageInput): string {
 	const isExhaust = commandClass === "exhaust";
 	const effectiveLimit = isExhaust ? cfg.maxBytes : cfg.payloadMaxBytes;
 
-	const cleaned = stripBuiltinFooter(text);
-	const preview = buildPreview(cleaned, cfg.previewHead, isError ? cfg.errorPreviewTail : cfg.previewTail);
-	const displayedPreviewLines = preview.headLines.length + preview.tailLines.length;
-	const omittedLines = builtinTruncated
-		? Math.max(preview.omittedLines, assessment.totalLines - displayedPreviewLines)
-		: preview.omittedLines;
-	const previewLineKeys = new Set([...preview.headLines, ...preview.tailLines].map((line) => line.trim()));
+	const cleaned = stripBuiltinFooter(text).replace(/\n+$/, "");
+	const totalLines = assessment.totalLines;
+	// pi's cap keeps the *tail*; when it fired, the text we hold is that tail, so there is no head to show.
+	const tailOnly = builtinTruncated || builtinTruncatedSource(text);
+	const shown = buildShownPreview(
+		cleaned,
+		totalLines,
+		tailOnly ? 0 : cfg.previewHead,
+		isError ? cfg.errorPreviewTail : cfg.previewTail,
+	);
+	const previewLineKeys = new Set([...shown.headLines, ...shown.keptLines].map((line) => line.trim()));
 	const allSignalLines = extractSignalLines(cleaned, SIGNAL_LINE_LIMIT);
 	const signalLines = allSignalLines.filter((line) => !previewLineKeys.has(line.trim()));
 
@@ -129,17 +173,26 @@ export function buildGuardMessage(input: GuardMessageInput): string {
 		parts.push("Command failed (non-zero exit) — the error tail is preserved below.");
 	}
 
-	const hasTail = preview.tailLines.length > 0 && omittedLines > 0;
-	if (hasTail) {
-		parts.push(`Preview — first ${preview.headLines.length} lines:`);
-		parts.push(...renderCollapsed(collapseRepeats(preview.headLines), "  "));
-		parts.push(`  ... [${omittedLines} lines omitted] ...`);
-		parts.push(`Preview — last ${preview.tailLines.length} lines:`);
-		parts.push(...renderCollapsed(collapseRepeats(preview.tailLines), "  "));
-	} else {
+	// One "frame" like the built-in's own truncation note: first chunk, what got skipped, last chunk.
+	// When pi already kept only the tail, mirror its own wording ("showing lines X of N") and add nothing.
+	const skipped = shown.hiddenLines + shown.foldedLines;
+	const skipNote = `  ... [${lineCount(skipped)} skipped${shown.foldedLines > 0 ? `, ${shown.foldedLines} repeats` : ""}] ...`;
+	if (skipped === 0) {
 		parts.push("Preview:");
-		parts.push(...renderCollapsed(collapseRepeats(preview.headLines), "  "));
-		if (omittedLines > 0) parts.push(`  ... [${omittedLines} lines omitted] ...`);
+		parts.push(...renderCollapsed(collapseRepeats([...shown.headLines, ...shown.keptLines]), "  "));
+	} else if (shown.headLines.length > 0 && shown.keptLines.length > 0) {
+		parts.push(`Preview — first ${lineCount(shown.headLines.length)}, last ${lineCount(shown.keptLines.length)}:`);
+		parts.push(...renderCollapsed(collapseRepeats(shown.headLines), "  "));
+		parts.push(skipNote);
+		parts.push(...renderCollapsed(collapseRepeats(shown.keptLines), "  "));
+	} else if (shown.keptLines.length > 0) {
+		parts.push(`Preview — showing lines ${totalLines - shown.keptLines.length + 1}-${totalLines} of ${totalLines}:`);
+		parts.push(...renderCollapsed(collapseRepeats(shown.keptLines), "  "));
+		parts.push(skipNote);
+	} else {
+		parts.push(`Preview — first ${lineCount(shown.headLines.length)}:`);
+		parts.push(...renderCollapsed(collapseRepeats(shown.headLines), "  "));
+		parts.push(skipNote);
 	}
 
 	if (signalLines.length > 0) {

@@ -21,8 +21,8 @@
  * - `system`: system dirs like `/etc`, `/var`, `/usr` (subdirs like `/etc/nginx` pass).
  */
 
-/** Leading env assignment at segment start (`FOO=bar cmd`). */
-const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+/** Leading env assignment at segment start (`FOO=bar cmd`); also used by the command classifier. */
+export const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 /** The `${HOME}` literal (built by joining so lint doesn't read it as a template placeholder). */
 const BRACED_HOME = "$" + "{HOME}";
 /** Command wrappers we skip past. */

@@ -34,13 +34,33 @@ export function formatBytes(bytes: number): string {
 
 const BUILTIN_FOOTER = /^\[Showing (?:lines|last) /;
 
-/** Drop the `[Showing ...]` footer the built-in bash tool adds on truncation — we give the full-file path ourselves, so it's just preview noise. */
+/**
+ * Did pi's built-in bash cap already fire on this text? The footer it appends is the evidence.
+ *
+ * It has to be read from the text itself, not from the `truncated` flag: that flag arrives fresh on
+ * the live event but comes back undefined when a session is replayed, so a resumed session would
+ * otherwise show a head window that is really a tail.
+ */
+export function builtinTruncatedSource(text: string): boolean {
+	return text.split("\n").some((line) => BUILTIN_FOOTER.test(line));
+}
+
+/**
+ * Drop the `[Showing ...]` footer the built-in bash tool adds on truncation — we give the full-file
+ * path ourselves, so it's just preview noise. The blank line in front of it goes too, else the
+ * preview starts on an empty line.
+ */
 export function stripBuiltinFooter(text: string): string {
 	if (!text.includes("[Showing ")) return text;
-	return text
-		.split("\n")
-		.filter((line) => !BUILTIN_FOOTER.test(line))
-		.join("\n");
+	const out: string[] = [];
+	for (const line of text.split("\n")) {
+		if (BUILTIN_FOOTER.test(line)) {
+			if (out.length > 0 && out[out.length - 1].trim() === "") out.pop();
+			continue;
+		}
+		out.push(line);
+	}
+	return out.join("\n");
 }
 
 export interface Preview {

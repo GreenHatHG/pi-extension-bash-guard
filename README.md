@@ -71,18 +71,33 @@ Four things, three hard and one soft:
      **passes through untouched**; over it, it's saved to disk with **no lecturing** — just where the
      full output is and how to pull only what's needed with the `read`/`grep` tools.
 
-   Both classes keep: head/tail preview (repeated lines folded to `(×N)`), auto-picked error/warning
-   lines, and the full-output path on disk.
+   Both classes keep: a head-and-tail preview (repeated lines folded to `(×N)`, the skipped middle
+   collapsed into one count line), auto-picked error/warning lines, and the full-output path on disk.
+   The line cap on each preview line keeps one giant minified-JS line from eating the whole message.
 
-   Sample when "process output" is intercepted:
+   One honest limit: when pi's own cap (2000 lines / 50KB) fires first, the text this extension gets is
+   already the **tail**, so the preview borrows the built-in's own wording (`Preview — showing lines
+   9986-10000 of 10000:`) instead of pretending the retained chunk has a head. This is detected from
+   the built-in's own footer line, not from the live `truncated` flag, so a resumed session behaves the
+   same way. Example from a real session — a `rg` over a minified bundle:
+
+```
+[BASH OUTPUT GUARD] Output withheld: 11 lines / 471.0KB (limit 8.0KB).
+Preview:
+  1459:`);if(newlineIndex===-1)return;emitLine(buffer.slice(0,newlineIndex)),buffer=buffer.slice(newlineIndex+1)}},onEnd=()=>{buffer+=decoder.end(),buffer.length>0&&(emitLine(buffer),buffer="")};return stream2.on("data",onData),stream2.on("en… [+24048 chars]
+Error/warning lines:
+  (already shown in the preview above)
+Full output saved to: /tmp/full.log
+```
+
+   Sample when "process output" is intercepted (normal, not pre-truncated):
 
 ```
 [BASH OUTPUT GUARD] Output withheld: 1842 lines / 214.3KB (limit 8.0KB).
 
-Preview — first 20 lines:
+Preview — first 20 lines, last 15 lines:
   <first 20 lines, repeated lines folded to (×N)>
-  ... [1795 lines omitted] ...
-Preview — last 15 lines:
+  ... [1807 lines skipped] ...
   <last 15 lines>
 
 Error/warning lines:
@@ -133,7 +148,11 @@ cap** in point 3 (non-search commands are never touched).
   hurt and "recursive search runs for tens of minutes unnoticed" is closed off.
 - **Full output is retrievable**: prefer reusing the **complete** output the built-in bash truncation
   saved; otherwise write the current text to this extension's temp file, cleaned up at session end.
-  The model can `read` with offset/limit or `rg`/`sed` it directly.
+  The model can `read` with offset/limit or `rg`/`sed` it directly. The tool result's `details`
+  (`truncation`, `fullOutputPath`) are handed back untouched, so pi's own "Full output: ..." hint still
+  shows up in the TUI.
+- **Leading assignments don't sink the call**: `FOO=bar rg x .` (and `f=x; rg foo $f | head`) is still
+  process output, so it gets the tight limit; a real unknown command in the pipeline still means payload.
 - **Cache-safe**: only append-only rewrites at the tail of `tool_result`; no systemPrompt changes, no
   tool-set changes, no `context` handlers.
 

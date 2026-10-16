@@ -63,9 +63,14 @@ describe("formatBytes", () => {
 });
 
 describe("stripBuiltinFooter", () => {
-	test("Drops the built-in [Showing lines ...] footer", () => {
+	test("Drops the built-in [Showing lines ...] footer and the blank line before it", () => {
 		const text = `a\nb\n\n[Showing lines 1-2 of 900. Full output: /tmp/x]`;
-		expect(stripBuiltinFooter(text)).toBe("a\nb\n");
+		expect(stripBuiltinFooter(text)).toBe("a\nb");
+	});
+
+	test("Drops a footer with no blank line in front", () => {
+		const text = `a\nb\n[Showing last 12.0KB of line 12 (line is 300.0KB). Full output: /tmp/x]`;
+		expect(stripBuiltinFooter(text)).toBe("a\nb");
 	});
 
 	test("Returns text unchanged when there is no footer", () => {
