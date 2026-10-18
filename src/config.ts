@@ -11,6 +11,8 @@ export const CONFIG_CUSTOM_TYPE = "bash-guard-config";
 export interface GuardConfig {
 	/** Master switch. When off, no opening hint and no output interception. */
 	enabled: boolean;
+	/** Opening discipline hint. When off, no `[BASH OUTPUT DISCIPLINE]` injection (fence notices are unaffected). */
+	hint: boolean;
 	/** Pre-scan block: find/grep/rg rooted at `$HOME`, `/`, or a system dir (`/etc`, etc.) is blocked outright. */
 	scanBlock: boolean;
 	/** Byte limit for process output (search/list/dump). 0 = no limit for this tier. */
@@ -31,6 +33,7 @@ export interface GuardConfig {
 
 export const DEFAULT_CONFIG: GuardConfig = {
 	enabled: true,
+	hint: true,
 	scanBlock: true,
 	maxBytes: 8 * 1024,
 	payloadMaxBytes: 30 * 1024,
@@ -60,7 +63,7 @@ function isFalsey(raw: string | undefined): boolean {
 
 /**
  * Build the starting config from env vars; bad values quietly fall back to defaults.
- * Reads PI_BASH_GUARD_DISABLED / ENABLED / SCAN_BLOCK / MAX_BYTES / PAYLOAD_MAX_BYTES /
+ * Reads PI_BASH_GUARD_DISABLED / ENABLED / HINT / SCAN_BLOCK / MAX_BYTES / PAYLOAD_MAX_BYTES /
  * PREVIEW_HEAD / PREVIEW_TAIL / ERROR_TAIL.
  */
 export function loadEnvConfig(env: NodeJS.ProcessEnv = process.env): GuardConfig {
@@ -75,6 +78,9 @@ export function loadEnvConfig(env: NodeJS.ProcessEnv = process.env): GuardConfig
 	}
 	if (isFalsey(env.PI_BASH_GUARD_SCAN_BLOCK)) {
 		cfg.scanBlock = false;
+	}
+	if (isFalsey(env.PI_BASH_GUARD_HINT)) {
+		cfg.hint = false;
 	}
 
 	cfg.maxBytes = nonNegativeInt(env.PI_BASH_GUARD_MAX_BYTES, cfg.maxBytes);
@@ -94,7 +100,7 @@ export type CommandParseResult =
 
 /**
  * Parse `/bash-guard` args: empty toggles on/off; `on`/`off`; `status`; `scan <on|off>`;
- * `bytes <n>`; `payload <n>`; `preview <head> [tail]` (n = 0 means no limit).
+ * `hint <on|off>`; `bytes <n>`; `payload <n>`; `preview <head> [tail]` (n = 0 means no limit).
  */
 export function parseCommandArgs(args: string, current: GuardConfig): CommandParseResult {
 	const tokens = args.trim().split(/\s+/).filter(Boolean);
@@ -118,6 +124,13 @@ export function parseCommandArgs(args: string, current: GuardConfig): CommandPar
 				return { kind: "config", config: { ...current, scanBlock: value === "on" } };
 			}
 			return { kind: "error", message: `scan expects on|off, got: ${rest[0] ?? "(nothing)"}` };
+		}
+		case "hint": {
+			const value = rest[0]?.toLowerCase();
+			if (value === "on" || value === "off") {
+				return { kind: "config", config: { ...current, hint: value === "on" } };
+			}
+			return { kind: "error", message: `hint expects on|off, got: ${rest[0] ?? "(nothing)"}` };
 		}
 		case "bytes": {
 			const n = Number.parseInt(rest[0] ?? "", 10);
@@ -153,7 +166,7 @@ export function parseCommandArgs(args: string, current: GuardConfig): CommandPar
 		default:
 			return {
 				kind: "error",
-				message: `Unknown /bash-guard argument: ${cmd}. Use: on | off | status | scan <on|off> | bytes <n> | payload <n> | preview <head> [tail]`,
+				message: `Unknown /bash-guard argument: ${cmd}. Use: on | off | status | scan <on|off> | hint <on|off> | bytes <n> | payload <n> | preview <head> [tail]`,
 			};
 	}
 }

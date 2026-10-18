@@ -52,26 +52,13 @@ export function normalizeCommand(command: string): string {
 }
 
 /** The output-discipline text injected at session start. */
-export function buildDisciplineText(cfg: GuardConfig, readOnly = false): string {
+export function buildDisciplineText(cfg: GuardConfig): string {
 	const exhaustLimit = describeLimit({ maxBytes: cfg.maxBytes });
 	const payloadLimit = describeLimit({ maxBytes: cfg.payloadMaxBytes });
 	const timeoutLine =
 		"Search commands (`find`, any `grep`, `rg`, `du`, `tree`) are capped at 5 minutes (300 seconds) automatically; " +
 		"scans rooted at `$HOME`, `/`, or a system directory like `/etc` are blocked before they run. " +
 		"Everything else runs with no timeout guard — pass an explicit `timeout` for anything that can hang (log follow, foreground servers).";
-	const fenceLines = readOnly
-		? [
-				"",
-				"[READ-ONLY SESSION] This session is fenced to read-only bash: every command is checked before it runs, and " +
-					"anything that writes, deletes, installs, builds, tests, or reaches the network is blocked with a " +
-					"`[BASH READ-ONLY FENCE]` reason (the reason names the way out). Read files with the `read` tool; use the recall CLI " +
-					"for session history; keep shell checks to bounded, read-only commands (`rg -l`, `sed -n`, `head`, `tail`, `wc`, " +
-					"`git log/show/diff`, `tmux capture-pane`). Redirects that discard a stream (`2>/dev/null`, `2>&1`) are fine — " +
-					"writing to a real file is not. A few things that look harmless are blocked on purpose: anything that hands " +
-					"the command to another program (a wrapper like `sudo`/`env`, `rg --pre`, `find -exec`, an interpreter), and " +
-					"`enclave`/`unboxexec` (a sandbox privilege channel, not a read-only command).",
-			]
-		: [];
 	return [
 		"[BASH OUTPUT DISCIPLINE]",
 		`An extension guards shell output. Search/listing/dump commands (e.g. \`rg\`, recursive \`grep\`, \`find\`, \`ls -R\`, ` +
@@ -86,7 +73,20 @@ export function buildDisciplineText(cfg: GuardConfig, readOnly = false): string 
 		"- Aggregate first: `| wc -l`, `| sort | uniq -c`, `-q`/`--quiet`/`-s`. Write big output to a file, then read/grep it selectively.",
 		"",
 		timeoutLine,
-		...fenceLines,
+	].join("\n");
+}
+
+/** The read-only fence notice, injected whenever a fence mode is active (independent of the hint switch). */
+export function buildFenceText(): string {
+	return [
+		"[READ-ONLY SESSION] This session is fenced to read-only bash: every command is checked before it runs, and " +
+			"anything that writes, deletes, installs, builds, tests, or reaches the network is blocked with a " +
+			"`[BASH READ-ONLY FENCE]` reason (the reason names the way out). Read files with the `read` tool; use the recall CLI " +
+			"for session history; keep shell checks to bounded, read-only commands (`rg -l`, `sed -n`, `head`, `tail`, `wc`, " +
+			"`git log/show/diff`, `tmux capture-pane`). Redirects that discard a stream (`2>/dev/null`, `2>&1`) are fine — " +
+			"writing to a real file is not. A few things that look harmless are blocked on purpose: anything that hands " +
+			"the command to another program (a wrapper like `sudo`/`env`, `rg --pre`, `find -exec`, an interpreter), and " +
+			"`enclave`/`unboxexec` (a sandbox privilege channel, not a read-only command).",
 	].join("\n");
 }
 
@@ -221,19 +221,23 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 
 	// ── Opening soft hint: inject once, cache-safe ────────────────────────────────
 	pi.on("before_agent_start", () => {
-		// A fenced process always needs the notice, even if the output guard is off
 		const mode = readOnlyMode();
-		if ((!cfg.enabled && mode === undefined) || framingDelivered) return;
+		const wantFence = mode !== undefined; // A fenced process always needs the notice, even if the guard or hint is off
+		const wantDiscipline = cfg.enabled && cfg.hint;
+		if ((!wantDiscipline && !wantFence) || framingDelivered) return;
 		framingDelivered = true;
 		try {
 			pi.appendEntry(FRAMING_CUSTOM_TYPE, { delivered: true });
 		} catch {
 			// Ignore: the next resume just re-injects the discipline text, harmless
 		}
+		const parts: string[] = [];
+		if (wantDiscipline) parts.push(buildDisciplineText(cfg));
+		if (wantFence) parts.push(buildFenceText());
 		return {
 			message: {
 				customType: FRAMING_CUSTOM_TYPE,
-				content: buildDisciplineText(cfg, mode === READ_ONLY_MODE),
+				content: parts.join("\n\n"),
 				display: false,
 			},
 		};
@@ -404,7 +408,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	// ── /bash-guard config command ─────────────────────────────────────────────────
 	pi.registerCommand("bash-guard", {
 		description:
-			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | bytes <n> | payload <n> | preview <head> [tail])",
+			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | hint <on|off> | bytes <n> | payload <n> | preview <head> [tail])",
 		handler: async (args, ctx) => {
 			const result = parseCommandArgs(args, cfg);
 			if (result.kind === "error") {
@@ -420,7 +424,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 							? `readonly fence: on (advisor allow list); blocked ${fenceHits}`
 							: `readonly fence: UNKNOWN mode "${mode}" -> all bash blocked (fail-closed)`;
 				ctx.ui.notify(
-					`bash-guard: ${cfg.enabled ? "on" : "off"}; exhaust limit ${describeLimit({ maxBytes: cfg.maxBytes })}; ` +
+					`bash-guard: ${cfg.enabled ? "on" : "off"}; hint ${cfg.hint ? "on" : "off"}; exhaust limit ${describeLimit({ maxBytes: cfg.maxBytes })}; ` +
 						`payload ${describeLimit({ maxBytes: cfg.payloadMaxBytes })}; scan-block ${cfg.scanBlock ? "on" : "off"}; ` +
 						`preview head ${cfg.previewHead} / tail ${cfg.previewTail} (errors ${cfg.errorPreviewTail}); hits ${hitCount}; ${fenceLine}`,
 					"info",

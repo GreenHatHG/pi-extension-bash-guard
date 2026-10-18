@@ -93,6 +93,25 @@ describe("parseCommandArgs", () => {
 		});
 	});
 
+	test("hint toggles the opening-injection switch", () => {
+		expect(parseCommandArgs("hint off", DEFAULT_CONFIG)).toEqual({
+			kind: "config",
+			config: { ...DEFAULT_CONFIG, hint: false },
+		});
+		expect(parseCommandArgs("hint on", { ...DEFAULT_CONFIG, hint: false })).toEqual({
+			kind: "config",
+			config: { ...DEFAULT_CONFIG, hint: true },
+		});
+		expect(parseCommandArgs("hint maybe", DEFAULT_CONFIG).kind).toBe("error");
+		expect(parseCommandArgs("hint", DEFAULT_CONFIG).kind).toBe("error");
+	});
+
+	test("PI_BASH_GUARD_HINT=0 seeds hint off", () => {
+		expect(loadEnvConfig({ PI_BASH_GUARD_HINT: "0" }).hint).toBe(false);
+		expect(loadEnvConfig({ PI_BASH_GUARD_HINT: "1" }).hint).toBe(true);
+		expect(loadEnvConfig({}).hint).toBe(true);
+	});
+
 	test("Unknown args error", () => {
 		expect(parseCommandArgs("bogus", DEFAULT_CONFIG).kind).toBe("error");
 	});

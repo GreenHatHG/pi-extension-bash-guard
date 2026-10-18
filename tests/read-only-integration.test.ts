@@ -16,18 +16,23 @@ function callBash(rt: MockRuntime, command: string) {
 	return rt.emit("tool_call", { type: "tool_call", toolName: "bash", input: { command } });
 }
 
+let savedHint: string | undefined;
 let savedMode: string | undefined;
 let savedEnabled: string | undefined;
 
 beforeEach(() => {
+	savedHint = process.env.PI_BASH_GUARD_HINT;
 	savedMode = process.env[MODE_ENV];
 	savedEnabled = process.env.PI_BASH_GUARD_ENABLED;
+	delete process.env.PI_BASH_GUARD_HINT;
 	delete process.env[MODE_ENV];
 	delete process.env.PI_BASH_GUARD_ENABLED;
 	vi.resetModules();
 });
 
 afterEach(() => {
+	if (savedHint === undefined) delete process.env.PI_BASH_GUARD_HINT;
+	else process.env.PI_BASH_GUARD_HINT = savedHint;
 	if (savedMode === undefined) delete process.env[MODE_ENV];
 	else process.env[MODE_ENV] = savedMode;
 	if (savedEnabled === undefined) delete process.env.PI_BASH_GUARD_ENABLED;

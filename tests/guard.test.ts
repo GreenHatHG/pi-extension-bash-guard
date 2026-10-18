@@ -20,6 +20,7 @@ function resultText(result: any): string {
 }
 
 beforeEach(() => {
+	delete process.env.PI_BASH_GUARD_HINT; // keep my dev-shell settings out of the test run
 	vi.resetModules();
 });
 
@@ -38,6 +39,38 @@ describe("Session-start discipline injection", () => {
 		const rt = await setup();
 		await rt.startAgent();
 		expect(rt.sessionEntries.some((e) => e.customType === "bash-guard-framing")).toBe(true);
+	});
+
+	test("hint off skips the discipline injection and writes no framing entry", async () => {
+		const rt = await setup();
+		await rt.runCommand("bash-guard", "hint off");
+		const first = await rt.startAgent();
+		expect(first).toBeUndefined();
+		expect(rt.sessionEntries.some((e) => e.customType === "bash-guard-framing")).toBe(false);
+	});
+
+	test("hint off then hint on re-enables the injection", async () => {
+		const rt = await setup();
+		await rt.runCommand("bash-guard", "hint off");
+		expect(await rt.startAgent()).toBeUndefined();
+		await rt.runCommand("bash-guard", "hint on");
+		const result = await rt.startAgent();
+		expect(result?.message?.content).toContain("[BASH OUTPUT DISCIPLINE]");
+	});
+
+	test("fence mode injects the fence notice even with hint off", async () => {
+		const prev = process.env.PI_BASH_GUARD_MODE;
+		process.env.PI_BASH_GUARD_MODE = "advisor";
+		try {
+			const rt = await setup();
+			await rt.runCommand("bash-guard", "hint off");
+			const result = await rt.startAgent();
+			expect(result?.message?.content).toContain("[READ-ONLY SESSION]");
+			expect(result?.message?.content).not.toContain("[BASH OUTPUT DISCIPLINE]");
+		} finally {
+			if (prev === undefined) delete process.env.PI_BASH_GUARD_MODE;
+			else process.env.PI_BASH_GUARD_MODE = prev;
+		}
 	});
 });
 

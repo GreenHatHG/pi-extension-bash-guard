@@ -15,7 +15,9 @@ Five things, four hard and two soft (the slice guard has both):
 1. **Set the rules up front (soft)**: on the session's first agent run, inject a `[BASH OUTPUT DISCIPLINE]`
    note (`display: false`, model context only, not the TUI) that tells the model how to bound searches /
    file reads / logs, and what to do when the guard steps in. A normal session gets it once; after
-   compaction it's injected again on the next agent run.
+   compaction it's injected again on the next agent run. Can be turned off with `/bash-guard hint off`
+   (e.g. when a global APPEND_SYSTEM.md already carries the same rules); the read-only fence notice is
+   unaffected and still injects.
 2. **Block unbounded scans before they run (hard)**: at `tool_call`, check the scan root of
    `find`/`grep -r`/`rg`/`du`/`tree`. If it's `$HOME` (including `~`, `$HOME`, `${HOME}`, a literal home
    path), `/`, or an exact system dir (`/etc`, `/var`, `/usr`, `/System`, `/Library`, `/Applications`,
@@ -207,11 +209,14 @@ Commands:
 | `/bash-guard on` / `off` | explicit on/off |
 | `/bash-guard status` | show current limits, preview lines, scan-block switch, session hit count |
 | `/bash-guard scan on` / `off` | toggle the "pre-block scans of `$HOME`/`/`/system dirs" rule alone |
+| `/bash-guard hint on` / `off` | toggle the opening `[BASH OUTPUT DISCIPLINE]` injection alone (fence notice unaffected) |
 | `/bash-guard bytes 8192` | change the process-output byte limit (`0` = no limit for this tier; use `on`/`off` for the master switch) |
 | `/bash-guard payload 30720` | change the valuable-payload byte limit (`0` = no limit for this tier) |
 | `/bash-guard preview 25 15` | change head/tail preview lines |
 
-Config is saved into the session with `pi.appendEntry` and replayed on resume.
+Config is saved into the session with `pi.appendEntry` and replayed on resume. Note that `hint off`
+persists with the session: if you later remove the file carrying the same rules (e.g. a global
+`APPEND_SYSTEM.md`), restore injection with `/bash-guard hint on`.
 
 Env vars act as **new-session seed values** (a saved session config wins):
 
@@ -220,6 +225,7 @@ Env vars act as **new-session seed values** (a saved session config wins):
 | `PI_BASH_GUARD_DISABLED` | — | any non-empty, non-0 value turns it off by default |
 | `PI_BASH_GUARD_ENABLED=0` | — | off by default |
 | `PI_BASH_GUARD_SCAN_BLOCK=0` | — | on by default; set to `0`/`false`/`off`/`no` to turn off the scan pre-block |
+| `PI_BASH_GUARD_HINT=0` | — | opening hint on by default; set to `0`/`false`/`off`/`no` to skip the `[BASH OUTPUT DISCIPLINE]` injection (fence notice unaffected) |
 | `PI_BASH_GUARD_MAX_BYTES` | `8192` | process-output byte limit, 0 = no byte limit for this tier (tiers are independent) |
 | `PI_BASH_GUARD_PAYLOAD_MAX_BYTES` | `30720` | valuable-payload byte limit, 0 = no limit for this tier |
 | `PI_BASH_GUARD_PREVIEW_HEAD` | `20` | head preview lines |
