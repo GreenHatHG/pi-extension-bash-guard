@@ -21,18 +21,20 @@ describe("isSearchCommand", () => {
 	});
 
 	test.each([
-		"grep foo file.txt", // non-recursive grep
+		"grep foo file.txt", // any grep counts, recursive or not (a bad regex on a huge file hangs too)
 		"grep -n foo file.txt",
-		"ls",
-		"git status",
-		"tail -f app.log",
-		"watch date",
-		"cat file",
-		"pnpm install",
-		"echo rg",
-	])("not a search command: %s", (command) => {
-		expect(isSearchCommand(command)).toBe(false);
+		"grep foo /",
+		"egrep foo file.txt",
+	])("search command: %s", (command) => {
+		expect(isSearchCommand(command)).toBe(true);
 	});
+
+	test.each(["ls", "git status", "tail -f app.log", "watch date", "cat file", "pnpm install", "echo rg"])(
+		"not a search command: %s",
+		(command) => {
+			expect(isSearchCommand(command)).toBe(false);
+		},
+	);
 });
 
 describe("searchTimeoutInjection — caps search commands at 5 minutes", () => {
@@ -53,9 +55,14 @@ describe("searchTimeoutInjection — caps search commands at 5 minutes", () => {
 	});
 
 	test("Non-search commands are never touched (hands off)", () => {
-		expect(inject("grep foo file.txt")).toBeNull();
 		expect(inject("git status")).toBeNull();
 		expect(inject("tail -f app.log")).toBeNull();
 		expect(inject("pnpm install", 999999)).toBeNull();
+	});
+
+	test("A single-file grep gets the cap too (the 643s bundle-regex case)", () => {
+		expect(inject("grep -o 'function buildSystemPrompt(.\\{0,4500\\}' dist/bundle/chunk.js | head -c 4600")).toBe(
+			SEARCH_TIMEOUT_SECONDS,
+		);
 	});
 });

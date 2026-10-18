@@ -3,7 +3,7 @@
 A pi extension that catches "big output" from bash/powershell and returns only a few key lines + the
 full-output path on disk + **write-it-right advice based on the command type**; blocks unbounded scans
 rooted at `$HOME`, `/`, or a system dir (`/etc`, etc.) **before they run**; caps search commands
-(`find`/`grep -r`/`rg`/`du`/`tree`) at a 5-minute timeout; can fence a whole process to **read-only bash**
+(`find`/`grep`/`rg`/`du`/`tree`) at a 5-minute timeout; can fence a whole process to **read-only bash**
 (`PI_BASH_GUARD_MODE=advisor`); and injects an output-discipline note once
 at session start. The goal isn't to cut output — it's to **push the model to write shell right**,
 without **blocking the payload the model really needs**.
@@ -23,7 +23,7 @@ Five things, four hard and two soft (the slice guard has both):
    (`rg -l <pattern> ~/Projects`, `mdfind -name '<name>'`, or add `-g '!Library/**'`). Deeper subdirs
    (`/etc/nginx`, `~/Library/Preferences`) always pass. Why: these commands produce almost no output,
    so the byte guard can't catch them at all, yet they walk tens of GB (a real incident took 934 seconds).
-3. **Cap search commands at 5 minutes (hard)**: at `tool_call`, for search commands (`find`, recursive
+3. **Cap search commands at 5 minutes (hard)**: at `tool_call`, for search commands (`find`, any
    `grep`, `rg`, `du`, `tree`) with no `timeout` or a value over 300 seconds, rewrite `input.timeout` in
    place to **300**; a smaller model-set value is respected (300 is a ceiling, not an override).
    Non-search commands are **left completely alone** — long runners like `tail -f`/`watch`/foreground
@@ -81,7 +81,7 @@ Five things, four hard and two soft (the slice guard has both):
 4. **Hard block when over the limit (hard)**: at `tool_result`, classify the command first, then use a
    different limit per class:
 
-   - **Process output** (search/list/dump: `rg`, recursive `grep`, `find`, `ls -R`, `env`, `ps`,
+   - **Process output** (search/list/dump: `rg`, any `grep`, `find`, `ls -R`, `env`, `ps`,
      `git log`…): uses the **tight limit** (default **8KB**). Replaced with a preview + full path +
      **rewrite hints**, and counted for repeat/escalation warnings.
    - **Valuable payload** (everything else, including file reads like `cat`/`sed` and builds/tests

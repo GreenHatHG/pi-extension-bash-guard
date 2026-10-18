@@ -56,7 +56,7 @@ export function buildDisciplineText(cfg: GuardConfig, readOnly = false): string 
 	const exhaustLimit = describeLimit({ maxBytes: cfg.maxBytes });
 	const payloadLimit = describeLimit({ maxBytes: cfg.payloadMaxBytes });
 	const timeoutLine =
-		"Search commands (`find`, recursive `grep`, `rg`, `du`, `tree`) are capped at 5 minutes (300 seconds) automatically; " +
+		"Search commands (`find`, any `grep`, `rg`, `du`, `tree`) are capped at 5 minutes (300 seconds) automatically; " +
 		"scans rooted at `$HOME`, `/`, or a system directory like `/etc` are blocked before they run. " +
 		"Everything else runs with no timeout guard — pass an explicit `timeout` for anything that can hang (log follow, foreground servers).";
 	const fenceLines = readOnly

@@ -388,8 +388,10 @@ function findRoots(args: string[]): string[] {
 }
 
 /**
- * `grep` only walks dirs with a recursive flag (`-r`/`-R`/`--recursive`); roots are the operands
- * after the pattern (with `-e`/`-f`, every operand is a root).
+ * `grep` roots are the operands after the pattern (with `-e`/`-f`, every operand is a root).
+ * The `recursive` flag is kept only so the scan-block check can skip non-recursive grep — a
+ * single-file grep like `grep foo /` can't walk a tree, so it's not a scan (but it still gets
+ * the 5-minute timeout cap, since a pathological regex on a huge file hangs just the same).
  */
 function grepRoots(args: string[]): { recursive: boolean; roots: string[] } {
 	let recursive = false;
@@ -420,8 +422,8 @@ function grepRoots(args: string[]): { recursive: boolean; roots: string[] } {
 		operands.push(token);
 	}
 
-	if (!recursive) return { recursive: false, roots: [] };
-	return { recursive: true, roots: patternProvided ? operands : operands.slice(1) };
+	if (!patternProvided && operands.length === 0) return { recursive, roots: [] };
+	return { recursive, roots: patternProvided ? operands : operands.slice(1) };
 }
 
 /** `rg` is recursive by default; roots are the operands after the pattern (with `-e`/`-f`, every operand is a root). */
@@ -636,8 +638,9 @@ export function parseScanCommands(command: string, depth = 0): ParsedScan[] {
 		if (tool === "find") {
 			out.push({ tool, recursive: true, roots: findRoots(args) });
 		} else if (tool === "grep" || tool === "egrep" || tool === "fgrep") {
-			const { recursive, roots } = grepRoots(args);
-			if (recursive) out.push({ tool, recursive, roots });
+			// Every grep is parsed (roots + recursion flag); the block check skips non-recursive ones,
+			// but the timeout cap covers them all — see `searchTimeoutInjection`.
+			out.push({ tool, ...grepRoots(args) });
 		} else if (tool === "rg") {
 			const { roots } = rgRoots(args);
 			out.push({ tool, recursive: true, roots });
@@ -672,12 +675,20 @@ export function buildScanReason(tool: string, root: string, kind: ScanKind): str
 	].join("\n");
 }
 
+/** True for the grep family: `grep`/`egrep`/`fgrep`. */
+function toolEndsWithGrep(tool: string): boolean {
+	return tool === "grep" || tool === "egrep" || tool === "fgrep";
+}
+
 /**
  * Check whether the command has an unbounded scan rooted at `$HOME`, `/`, or an exact system dir.
  * Returns a `ScanBlock` (with reason) on a hit, else null.
  */
 export function detectBlockedScan(command: string, opts: { home: string }): ScanBlock | null {
 	for (const scan of parseScanCommands(command)) {
+		// Non-recursive grep reads explicit files only — it can't walk a tree, so it never blocks.
+		// (`egrep`/`fgrep` are the same tool under old names.)
+		if (toolEndsWithGrep(scan.tool) && !scan.recursive) continue;
 		for (const root of scan.roots) {
 			const kind = classifyRoot(root, opts.home);
 			if (kind) return { tool: scan.tool, root, kind, reason: buildScanReason(scan.tool, root, kind) };

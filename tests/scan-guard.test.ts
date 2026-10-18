@@ -191,7 +191,8 @@ describe("detectBlockedScan — passes narrowed or unrelated commands", () => {
 		"find /tmp -maxdepth 1",
 		"find . -name x",
 		"grep -r foo ./src",
-		"grep foo /",
+		"grep foo /", // single-file grep can't walk a tree — capped, but never blocked
+		"grep foo $HOME", // same: explicit files only, no scan
 		"rg foo /tmp",
 		"rg -e foo -e bar ./src",
 		'echo "a;b"',

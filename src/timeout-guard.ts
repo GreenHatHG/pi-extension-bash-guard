@@ -1,7 +1,7 @@
 /**
  * Pure helper: timeout cap for search commands.
  *
- * Only search commands (`find` / recursive `grep` / `rg` / `du` / `tree`) are time-limited, at 5
+ * Only search commands (`find` / `grep` (any) / `rg` / `du` / `tree`) are time-limited, at 5
  * minutes. Missing `timeout` injects 300s; a larger value is also pulled down to 300; a smaller one
  * is respected (300 is a ceiling, not an override). Non-search commands are left alone.
  */
@@ -11,7 +11,7 @@ import { parseScanCommands } from "./scan-guard";
 /** Hard cap for search commands, in seconds: 5 minutes. */
 export const SEARCH_TIMEOUT_SECONDS = 300;
 
-/** Whether the command is a search scan (`find` / recursive `grep` / `rg` / `du` / `tree`). */
+/** Whether the command is a search scan (`find` / any `grep` / `rg` / `du` / `tree`). */
 export function isSearchCommand(command: string): boolean {
 	return parseScanCommands(command).length > 0;
 }
