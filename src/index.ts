@@ -17,6 +17,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { assessOutput, describeLimit } from "./analyze";
+import { validateToolArgs } from "./arg-guard";
 import { classifyCommand } from "./classify";
 import { CONFIG_CUSTOM_TYPE, type GuardConfig, loadEnvConfig, parseCommandArgs, readPersistedConfig } from "./config";
 import { buildGuardMessage } from "./guard-message";
@@ -141,6 +142,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	let exhaustHits = 0;
 	/** Fence hits: kept apart from output-guard hits, they mean different things. */
 	let fenceHits = 0;
+	let argGuardHits = 0;
 	let framingDelivered = false;
 	let escalationWarningDelivered = false;
 	const guardedCommands = new Set<string>();
@@ -200,6 +202,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		hitCount = 0;
 		exhaustHits = 0;
 		fenceHits = 0;
+		argGuardHits = 0;
 		framingDelivered = false;
 		escalationWarningDelivered = false;
 		tempStorage.dir = undefined;
@@ -250,6 +253,20 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 
 	// ── Pre-run block: fence the command, then block unbounded scans, then cap search timeouts ──
 	pi.on("tool_call", (event, ctx) => {
+		// Generic argument guard runs first and covers EVERY tool, not just bash: a tool call is
+		// an API call, and a degenerate argument (a path repeated ~2000 times, a negative limit,
+		// a runaway string) should be refused before it touches the filesystem. `read`/`write`/
+		// `edit`/`grep` all pass a `path`; offsets and limits pass numbers; both shapes are checked
+		// by key, so no per-tool list is needed.
+		if (cfg.argGuard) {
+			const argVerdict = validateToolArgs(event.input);
+			if (!argVerdict.ok) {
+				argGuardHits++;
+				updateStatus(ctx);
+				return { block: true, reason: argVerdict.reason };
+			}
+		}
+
 		if (!GUARDED_TOOLS.has(event.toolName)) return;
 		const input = event.input as { command?: unknown; timeout?: unknown } | undefined;
 		const command = typeof input?.command === "string" ? input.command : "";
@@ -408,7 +425,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	// ── /bash-guard config command ─────────────────────────────────────────────────
 	pi.registerCommand("bash-guard", {
 		description:
-			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | hint <on|off> | bytes <n> | payload <n> | preview <head> [tail])",
+			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | hint <on|off> | arg <on|off> | bytes <n> | payload <n> | preview <head> [tail])",
 		handler: async (args, ctx) => {
 			const result = parseCommandArgs(args, cfg);
 			if (result.kind === "error") {
@@ -424,7 +441,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 							? `readonly fence: on (advisor allow list); blocked ${fenceHits}`
 							: `readonly fence: UNKNOWN mode "${mode}" -> all bash blocked (fail-closed)`;
 				ctx.ui.notify(
-					`bash-guard: ${cfg.enabled ? "on" : "off"}; hint ${cfg.hint ? "on" : "off"}; exhaust limit ${describeLimit({ maxBytes: cfg.maxBytes })}; ` +
+					`bash-guard: ${cfg.enabled ? "on" : "off"}; hint ${cfg.hint ? "on" : "off"}; arg-guard ${cfg.argGuard ? "on" : "off"} (${argGuardHits}); exhaust limit ${describeLimit({ maxBytes: cfg.maxBytes })}; ` +
 						`payload ${describeLimit({ maxBytes: cfg.payloadMaxBytes })}; scan-block ${cfg.scanBlock ? "on" : "off"}; ` +
 						`preview head ${cfg.previewHead} / tail ${cfg.previewTail} (errors ${cfg.errorPreviewTail}); hits ${hitCount}; ${fenceLine}`,
 					"info",

@@ -497,3 +497,37 @@ describe("/bash-guard config command", () => {
 		expect(rt.notifications.at(-1)?.kind).toBe("error");
 	});
 });
+
+describe("tool argument guard", () => {
+	test("A degenerate repeated path on the read tool is blocked before it runs", async () => {
+		const rt = await setup();
+		const input = { path: `/p/${"../p/".repeat(1937)}`, offset: 0, limit: 50 };
+		const res = await rt.emit("tool_call", { toolName: "read", input });
+		expect(res?.block).toBe(true);
+		expect(res?.reason).toContain("[ARG GUARD]");
+	});
+
+	test("A negative limit on the read tool is blocked", async () => {
+		const rt = await setup();
+		const res = await rt.emit("tool_call", { toolName: "read", input: { path: "/p/f.ts", limit: -3 } });
+		expect(res?.block).toBe(true);
+		expect(res?.reason).toContain("[ARG GUARD]");
+	});
+
+	test("A sane read call passes through untouched", async () => {
+		const rt = await setup();
+		const input = { path: "/project/src/main.ts", offset: 0, limit: 50 };
+		const res = await rt.emit("tool_call", { toolName: "read", input });
+		expect(res).toBeUndefined();
+	});
+
+	test("arg guard off lets the degenerate path through", async () => {
+		const rt = await setup();
+		await rt.runCommand("bash-guard", "arg off");
+		const res = await rt.emit("tool_call", {
+			toolName: "read",
+			input: { path: `/p/${"../p/".repeat(1937)}` },
+		});
+		expect(res).toBeUndefined();
+	});
+});

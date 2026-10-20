@@ -4,8 +4,11 @@ A pi extension that catches "big output" from bash/powershell and returns only a
 full-output path on disk + **write-it-right advice based on the command type**; blocks unbounded scans
 rooted at `$HOME`, `/`, or a system dir (`/etc`, etc.) **before they run**; caps search commands
 (`find`/`grep`/`rg`/`du`/`tree`) at a 5-minute timeout; can fence a whole process to **read-only bash**
-(`PI_BASH_GUARD_MODE=advisor`); and injects an output-discipline note once
-at session start. The goal isn't to cut output — it's to **push the model to write shell right**,
+(`PI_BASH_GUARD_MODE=advisor`); injects an output-discipline note once
+at session start; and — the newest job — treats **every tool call like an API call**, validating
+path/number/string arguments at the `tool_call` boundary so a degenerate argument (a `path` repeated
+~2000 times, a negative `limit`, a runaway string) is refused before it touches anything.
+The goal isn't to cut output — it's to **push the model to write shell right**,
 without **blocking the payload the model really needs**.
 
 ## Behavior
@@ -48,7 +51,27 @@ Five things, four hard and two soft (the slice guard has both):
    (at 18:56 of an 8-hour session / 12 minutes into a tweak loop). Only `sed -n` counts toward the
    hard rules — `head`/`tail` feeds the soft counter only, because `tail -f` log following is a
    highly legitimate pattern the replay never validated against.
-4. **Read-only fence for fenced processes (hard, opt-in)**: when `PI_BASH_GUARD_MODE` is set, every
+4. **Validate every tool-call argument (hard)**: at `tool_call`, **before** the bash-only rules and for
+   **every** tool (not just bash/powershell), check the argument object by shape, not by tool name:
+   - **`path`** (any tool that takes one — `read`/`write`/`edit`/`grep`): refused if longer than
+     `512` chars, if it climbs more than 8 parent (`..`) segments, or if one `/`-segment repeats 20+
+     times (a single dominant segment is the runaway signature — the incident repeated `claude-code`
+     ~1937 times). This is what stops a `path` like
+     `…/claude-code/../claude-code/../…` ×~2000 (a real incident) from ever reaching the filesystem.
+
+     Thresholds are calibrated against the real pi session history on this machine (117 jsonl
+     sessions): normal paths are p50=63 / p99=93 chars, max ~113, and never repeat a segment — so
+     these limits refuse exactly one real call (the incident) and pass every other recorded one.
+   - **numbers** (`offset`/`limit`/`timeout`/…): refused if `NaN`/`Infinity`, negative, or above `1e9`.
+     A tool call is an API call — a client sending `limit: -3` or `offset: Infinity` should get a
+     `4xx`, not a crash.
+   - **any string *instruction* (`command`/`pattern`)**: refused if over `50_000` chars (a runaway
+     string-argument loop). Payload keys — a `write`'s `content`, an `edit`'s `newText` — are
+     deliberately not length-checked: writing a 60KB file is a normal call.
+
+   A violation returns `{ block: true, reason: "[ARG GUARD] …" }`, so the model sees exactly what it
+   got wrong and can reissue the call. Toggle with `/bash-guard arg off` or `PI_BASH_GUARD_ARG_GUARD=0`.
+5. **Read-only fence for fenced processes (hard, opt-in)**: when `PI_BASH_GUARD_MODE` is set, every
    `bash`/`powershell` call is judged **before it runs** against a read-only allow list, and anything
    that writes, deletes, installs, builds, tests, or reaches the network is blocked with a
    `[BASH READ-ONLY FENCE]` reason that names the way out (the `read` tool, the session-recall CLI).
@@ -210,6 +233,7 @@ Commands:
 | `/bash-guard status` | show current limits, preview lines, scan-block switch, session hit count |
 | `/bash-guard scan on` / `off` | toggle the "pre-block scans of `$HOME`/`/`/system dirs" rule alone |
 | `/bash-guard hint on` / `off` | toggle the opening `[BASH OUTPUT DISCIPLINE]` injection alone (fence notice unaffected) |
+| `/bash-guard arg on` / `off` | toggle the tool-argument validation alone (path/number/string checks) |
 | `/bash-guard bytes 8192` | change the process-output byte limit (`0` = no limit for this tier; use `on`/`off` for the master switch) |
 | `/bash-guard payload 30720` | change the valuable-payload byte limit (`0` = no limit for this tier) |
 | `/bash-guard preview 25 15` | change head/tail preview lines |
@@ -226,6 +250,7 @@ Env vars act as **new-session seed values** (a saved session config wins):
 | `PI_BASH_GUARD_ENABLED=0` | — | off by default |
 | `PI_BASH_GUARD_SCAN_BLOCK=0` | — | on by default; set to `0`/`false`/`off`/`no` to turn off the scan pre-block |
 | `PI_BASH_GUARD_HINT=0` | — | opening hint on by default; set to `0`/`false`/`off`/`no` to skip the `[BASH OUTPUT DISCIPLINE]` injection (fence notice unaffected) |
+| `PI_BASH_GUARD_ARG_GUARD=0` | — | argument validation on by default; set to `0`/`false`/`off`/`no` to disable the tool-call arg checks |
 | `PI_BASH_GUARD_MAX_BYTES` | `8192` | process-output byte limit, 0 = no byte limit for this tier (tiers are independent) |
 | `PI_BASH_GUARD_PAYLOAD_MAX_BYTES` | `30720` | valuable-payload byte limit, 0 = no limit for this tier |
 | `PI_BASH_GUARD_PREVIEW_HEAD` | `20` | head preview lines |

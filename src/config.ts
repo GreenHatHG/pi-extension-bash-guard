@@ -29,6 +29,8 @@ export interface GuardConfig {
 	previewTail: number;
 	/** Tail preview lines when the command fails (non-zero exit) — errors are usually at the end, so show more. */
 	errorPreviewTail: number;
+	/** Validate tool-call arguments (paths, numbers, string length) at the tool_call boundary. */
+	argGuard: boolean;
 }
 
 export const DEFAULT_CONFIG: GuardConfig = {
@@ -40,6 +42,7 @@ export const DEFAULT_CONFIG: GuardConfig = {
 	previewHead: 20,
 	previewTail: 15,
 	errorPreviewTail: 25,
+	argGuard: true,
 };
 
 function positiveInt(raw: string | undefined, fallback: number): number {
@@ -81,6 +84,9 @@ export function loadEnvConfig(env: NodeJS.ProcessEnv = process.env): GuardConfig
 	}
 	if (isFalsey(env.PI_BASH_GUARD_HINT)) {
 		cfg.hint = false;
+	}
+	if (isFalsey(env.PI_BASH_GUARD_ARG_GUARD)) {
+		cfg.argGuard = false;
 	}
 
 	cfg.maxBytes = nonNegativeInt(env.PI_BASH_GUARD_MAX_BYTES, cfg.maxBytes);
@@ -132,6 +138,13 @@ export function parseCommandArgs(args: string, current: GuardConfig): CommandPar
 			}
 			return { kind: "error", message: `hint expects on|off, got: ${rest[0] ?? "(nothing)"}` };
 		}
+		case "arg": {
+			const value = rest[0]?.toLowerCase();
+			if (value === "on" || value === "off") {
+				return { kind: "config", config: { ...current, argGuard: value === "on" } };
+			}
+			return { kind: "error", message: `arg expects on|off, got: ${rest[0] ?? "(nothing)"}` };
+		}
 		case "bytes": {
 			const n = Number.parseInt(rest[0] ?? "", 10);
 			if (!Number.isFinite(n) || n < 0) {
@@ -166,7 +179,7 @@ export function parseCommandArgs(args: string, current: GuardConfig): CommandPar
 		default:
 			return {
 				kind: "error",
-				message: `Unknown /bash-guard argument: ${cmd}. Use: on | off | status | scan <on|off> | hint <on|off> | bytes <n> | payload <n> | preview <head> [tail]`,
+				message: `Unknown /bash-guard argument: ${cmd}. Use: on | off | status | scan <on|off> | hint <on|off> | arg <on|off> | bytes <n> | payload <n> | preview <head> [tail]`,
 			};
 	}
 }
