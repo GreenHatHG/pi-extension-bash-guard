@@ -13,7 +13,7 @@ without **blocking the payload the model really needs**.
 
 ## Behavior
 
-Five things, four hard and two soft (the slice guard has both):
+Five things (the loop guard, the arg guard, and the fence are hard; the hint and the output cap have a soft side):
 
 1. **Set the rules up front (soft)**: on the session's first agent run, inject a `[BASH OUTPUT DISCIPLINE]`
    note (`display: false`, model context only, not the TUI) that tells the model how to bound searches /
@@ -33,24 +33,20 @@ Five things, four hard and two soft (the slice guard has both):
    place to **300**; a smaller model-set value is respected (300 is a ceiling, not an override).
    Non-search commands are **left completely alone** — long runners like `tail -f`/`watch`/foreground
    servers keep going.
-3.5. **Catch slice-read death loops (hard + soft)**: at `tool_call`, count small `sed -n 'A,Bp'`
-   slice reads per file. Two breakers, both with a way out:
-   - **Volume breaker**: 80 slice reads of one file in a session → further bash slice reads of that
-     file are blocked for the session (the `read` tool with offset/limit is not). This catches the
-     slow burn where every window is different — a real runaway session did 1242 reads of one file
-     over 8 hours and never finished; normal sessions top out at 53.
-   - **Loop breaker**: 6 fast re-reads (same exact range, 15s–10min apart) of one file inside a
-     30-minute window → block that call, with "the content is already in your context — work from
-     it, or tell the user where you are stuck". This catches the "tweak → re-read the same lines"
-     loop that never reaches the volume cap.
-   - **Soft nudge**: at 20 slice reads of one file, a one-line hint rides on the result once
-     ("read a big block once with the `read` tool instead of more slices").
+3.5. **Catch silent same-shape death loops (hard)**: at `tool_call`, reduce the command to a shape
+   (program + subcommand, variable args dropped, `cd dir && …` chains judged by the real command) and
+   walk the session branch backwards: if the same shape has fired **35 times in a row with no
+   assistant text in between**, block the call with "reply with one short line saying where you are
+   stuck, then change approach". Recovery is one line of text — any assistant text (or user message)
+   resets the streak, and changing command shape starts a new count.
 
-   Thresholds come from replaying every recorded session on this machine (992 sessions, ~25k slice
-   reads): the two breakers fire on zero normal sessions and catch both known runaway sessions
-   (at 18:56 of an 8-hour session / 12 minutes into a tweak loop). Only `sed -n` counts toward the
-   hard rules — `head`/`tail` feeds the soft counter only, because `tail -f` log following is a
-   highly legitimate pattern the replay never validated against.
+   Both known runaway sessions share exactly this signature: a recall loop made 222 `bun main.ts
+   recall` calls with zero text between them; an 8-hour loop made 402 consecutive silent `sed` calls
+   (all on one file). Replaying 164 normal sessions: silent same-shape streak p50=1, p90=6, max=28 —
+   so 35 sits above every normal session and catches both runaways in minutes (the sed loop averaged
+   one call per 16s, so ~10 minutes after the loop starts). The replace-everything rule it retired
+   (per-file `sed -n` slice counters, volume 80 / rapid-repeat 6) was removed once this rule was
+   verified to catch the same incident far earlier.
 4. **Validate every tool-call argument (hard)**: at `tool_call`, **before** the bash-only rules and for
    **every** tool (not just bash/powershell), check the argument object by shape, not by tool name:
    - **`path`** (any tool that takes one — `read`/`write`/`edit`/`grep`): refused if longer than
@@ -234,6 +230,7 @@ Commands:
 | `/bash-guard scan on` / `off` | toggle the "pre-block scans of `$HOME`/`/`/system dirs" rule alone |
 | `/bash-guard hint on` / `off` | toggle the opening `[BASH OUTPUT DISCIPLINE]` injection alone (fence notice unaffected) |
 | `/bash-guard arg on` / `off` | toggle the tool-argument validation alone (path/number/string checks) |
+| `/bash-guard streak on` / `off` | toggle the silent same-shape loop breaker alone |
 | `/bash-guard bytes 8192` | change the process-output byte limit (`0` = no limit for this tier; use `on`/`off` for the master switch) |
 | `/bash-guard payload 30720` | change the valuable-payload byte limit (`0` = no limit for this tier) |
 | `/bash-guard preview 25 15` | change head/tail preview lines |
@@ -251,6 +248,7 @@ Env vars act as **new-session seed values** (a saved session config wins):
 | `PI_BASH_GUARD_SCAN_BLOCK=0` | — | on by default; set to `0`/`false`/`off`/`no` to turn off the scan pre-block |
 | `PI_BASH_GUARD_HINT=0` | — | opening hint on by default; set to `0`/`false`/`off`/`no` to skip the `[BASH OUTPUT DISCIPLINE]` injection (fence notice unaffected) |
 | `PI_BASH_GUARD_ARG_GUARD=0` | — | argument validation on by default; set to `0`/`false`/`off`/`no` to disable the tool-call arg checks |
+| `PI_BASH_GUARD_STREAK_BLOCK=0` | — | loop breaker on by default; set to `0`/`false`/`off`/`no` to disable the silent same-shape breaker |
 | `PI_BASH_GUARD_MAX_BYTES` | `8192` | process-output byte limit, 0 = no byte limit for this tier (tiers are independent) |
 | `PI_BASH_GUARD_PAYLOAD_MAX_BYTES` | `30720` | valuable-payload byte limit, 0 = no limit for this tier |
 | `PI_BASH_GUARD_PREVIEW_HEAD` | `20` | head preview lines |
@@ -278,14 +276,13 @@ process it shows `🛡 read-only` and `🛡 read-only ×N` (fence blocks only).
   A `tool_result` content patch is enough.
 - **Why not cover `read`/`grep`/`find`**: those built-ins already have structured truncation and
   offset/limit/head_limit params, so v1 doesn't handle them again.
-- **Why the slice guard only watches `sed -n`**: the replay data that set the thresholds only
-  validated `sed -n` patterns; `head`/`tail` (2.5x more common) include highly legitimate forms like
-  log following and build-tail peeks. They still feed the soft counter, so a session that drifts
-  into slice-reading gets the early hint regardless of which tool it uses.
-- **Why block instead of nudge harder**: a runaway loop burns hours per incident; a false positive
-  costs one tool switch (the block reason points at `read`, which is never blocked for that file).
-  With the replay data showing a 2x gap between normal (52 reads) and runaway (1242), the block's
-  error direction is cheap.
+- **Why a silent streak, not per-command counters**: both real death loops kept firing one command
+  shape with zero commentary, while normal sessions — even heavy-search ones (a 28-streak `rg`
+  session) — interleave text regularly. Counting exact commands misses the loop that varies its
+  arguments (the recall loop used ~140 different queries); counting per-file volume only guards one
+  tool and needs 80+ calls before firing. The streak drops at 35, the error direction is cheap
+  (recovery = emit one line of text), and non-bash tools neither extend nor break the count, so
+  pairing one `read` with twenty `rg` calls is still caught.
 - **Why inject a search `timeout` instead of blocking**: `tool_call`'s `input` is mutable, so pulling
   `timeout` to 300 seconds takes effect right away with no extra "block → resend" round trip; and it's
   a ceiling — a smaller model-set budget is used as is. The cost is the model may not know it was
@@ -312,6 +309,7 @@ src/analyze.ts        size checks, built-in footer removal, preview trim, repeat
 src/classify.ts       command classes: process output / build-test / valuable payload (strict allowlist, word list from claude-code)
 src/suggest.ts        command heuristics -> rewrite hints
 src/scan-guard.ts     scan parsing: quote-aware segment split + tokenizer + find/grep/rg/du/tree root check
+src/streak-guard.ts   shape normalization + silent same-shape streak measurement (death-loop breaker)
 src/read-only.ts      the read-only allow list: judge a command, and read the fence mode from the env
 src/timeout-guard.ts  5-minute timeout cap for search commands (pure helper)
 src/guard-message.ts  build the final guard text

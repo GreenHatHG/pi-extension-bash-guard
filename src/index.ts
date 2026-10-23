@@ -23,7 +23,7 @@ import { CONFIG_CUSTOM_TYPE, type GuardConfig, loadEnvConfig, parseCommandArgs, 
 import { buildGuardMessage } from "./guard-message";
 import { judgeReadOnlyCommand, MODE_ENV, READ_ONLY_MODE, readOnlyMode } from "./read-only";
 import { detectBlockedScan } from "./scan-guard";
-import { MAX_TRACKED_FILES, newFileSliceState, parseSlices, recordSlice } from "./slice-guard";
+import { measureSilentStreak, STREAK_BLOCK_AT, shapeOf, streakBlockMessage } from "./streak-guard";
 import { isSearchCommand, SEARCH_TIMEOUT_SECONDS, searchTimeoutInjection } from "./timeout-guard";
 
 /** Status bar key. */
@@ -33,8 +33,7 @@ const FRAMING_CUSTOM_TYPE = "bash-guard-framing";
 /** Tools the guard watches. */
 const GUARDED_TOOLS = new Set(["bash", "powershell"]);
 /** Cap on the intercepted-command set; clear it when full so it can't grow forever. */
-const MAX_TRACKED_COMMANDS = 200;
-/** Marker for pi's bash timeout error (e.g. `Command timed out after 600 seconds`). */
+const MAX_TRACKED_COMMANDS = 200; /** Marker for pi's bash timeout error (e.g. `Command timed out after 600 seconds`). */
 const TIMEOUT_SIGNAL = /timed out after \d+ seconds/i;
 /**
  * Hint added when we hit a timeout and output is small (so the size guard never fired).
@@ -142,12 +141,11 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	let exhaustHits = 0;
 	/** Fence hits: kept apart from output-guard hits, they mean different things. */
 	let fenceHits = 0;
+	let streakHits = 0;
 	let argGuardHits = 0;
 	let framingDelivered = false;
 	let escalationWarningDelivered = false;
 	const guardedCommands = new Set<string>();
-	/** Per-file slice-read counters (see slice-guard.ts); keyed by normalized path. */
-	const sliceStates = new Map<string, ReturnType<typeof newFileSliceState>>();
 	const tempDirs = new Set<string>();
 	const tempStorage: TempStorage = { nextFile: 0 };
 
@@ -157,27 +155,6 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		} catch {
 			// Save failure isn't fatal: config is still right in this process, just lost on resume
 		}
-	}
-
-	/**
-	 * Soft nudge text for a finished slice-read call, or undefined when none applies.
-	 *
-	 * `tool_result` has no clean way to know which file the call read, so the nudge key is recomputed
-	 * from the command itself: any file in this command that has crossed the nudge threshold counts.
-	 * Hard blocks already happened at `tool_call`; this is only the gentler early hint.
-	 */
-	function sliceNudgeText(command: string, toolName: string): string | undefined {
-		if (toolName !== "bash") return undefined;
-		const slices = parseSlices(command);
-		if (slices.length === 0) return undefined;
-		const nowMs = Date.now();
-		for (const slice of slices) {
-			const state = sliceStates.get(slice.file);
-			if (!state) continue;
-			const verdict = recordSlice(state, slice, nowMs);
-			if (verdict.kind === "nudge") return verdict.message;
-		}
-		return undefined;
 	}
 
 	function updateStatus(ctx: ExtensionContext | undefined): void {
@@ -202,13 +179,13 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		hitCount = 0;
 		exhaustHits = 0;
 		fenceHits = 0;
+		streakHits = 0;
 		argGuardHits = 0;
 		framingDelivered = false;
 		escalationWarningDelivered = false;
 		tempStorage.dir = undefined;
 		tempStorage.dirPromise = undefined;
 		tempStorage.nextFile = 0;
-		sliceStates.clear();
 		const branch = ctx.sessionManager?.getBranch?.() ?? [];
 		const persisted = readPersistedConfig(branch);
 		cfg = persisted ?? loadEnvConfig();
@@ -295,23 +272,17 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 		if (!cfg.enabled) return;
 		if (command === "") return;
 
-		// Slice-read loop guard: count small `sed -n` reads per file; block when the volume cap or
-		// the fast-repeat cap trips. Runs before the scan block so a blocked loop can't waste a scan.
-		const slices = parseSlices(command);
-		if (slices.length > 0) {
-			if (sliceStates.size >= MAX_TRACKED_FILES) sliceStates.clear();
-			const nowMs = Date.now();
-			for (const slice of slices) {
-				let state = sliceStates.get(slice.file);
-				if (!state) {
-					state = newFileSliceState();
-					sliceStates.set(slice.file, state);
-				}
-				const verdict = recordSlice(state, slice, nowMs);
-				if (verdict.kind === "block") {
-					fenceHits++;
+		// Silent same-shape loop guard: block when the assistant has been firing one command shape
+		// with no text in between (both known death loops look like this). Runs before the scan block
+		// so a stuck loop can't waste a scan.
+		if (cfg.streakBlock) {
+			const shape = shapeOf(command);
+			if (shape !== null) {
+				const streak = measureSilentStreak(ctx.sessionManager?.getBranch?.() ?? [], shape);
+				if (streak + 1 >= STREAK_BLOCK_AT) {
+					streakHits++;
 					updateStatus(ctx);
-					return { block: true, reason: verdict.message };
+					return { block: true, reason: streakBlockMessage(streak + 1) };
 				}
 			}
 		}
@@ -378,11 +349,6 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 			if (event.isError && TIMEOUT_SIGNAL.test(text) && isSearchCommand(command)) {
 				return { content: [{ type: "text" as const, text: `${text}\n\n${TIMEOUT_HINT}` }], details: event.details };
 			}
-			// Slice-loop soft nudge: ride along on any result once the read count gets high.
-			const nudge = sliceNudgeText(command, event.toolName);
-			if (nudge) {
-				return { content: [{ type: "text" as const, text: `${text}\n\n${nudge}` }], details: event.details };
-			}
 			return;
 		}
 
@@ -425,7 +391,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	// ── /bash-guard config command ─────────────────────────────────────────────────
 	pi.registerCommand("bash-guard", {
 		description:
-			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | hint <on|off> | arg <on|off> | bytes <n> | payload <n> | preview <head> [tail])",
+			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | hint <on|off> | arg <on|off> | streak <on|off> | bytes <n> | payload <n> | preview <head> [tail])",
 		handler: async (args, ctx) => {
 			const result = parseCommandArgs(args, cfg);
 			if (result.kind === "error") {
@@ -441,7 +407,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 							? `readonly fence: on (advisor allow list); blocked ${fenceHits}`
 							: `readonly fence: UNKNOWN mode "${mode}" -> all bash blocked (fail-closed)`;
 				ctx.ui.notify(
-					`bash-guard: ${cfg.enabled ? "on" : "off"}; hint ${cfg.hint ? "on" : "off"}; arg-guard ${cfg.argGuard ? "on" : "off"} (${argGuardHits}); exhaust limit ${describeLimit({ maxBytes: cfg.maxBytes })}; ` +
+					`bash-guard: ${cfg.enabled ? "on" : "off"}; hint ${cfg.hint ? "on" : "off"}; arg-guard ${cfg.argGuard ? "on" : "off"} (${argGuardHits}); streak ${cfg.streakBlock ? "on" : "off"} (${streakHits}); exhaust limit ${describeLimit({ maxBytes: cfg.maxBytes })}; ` +
 						`payload ${describeLimit({ maxBytes: cfg.payloadMaxBytes })}; scan-block ${cfg.scanBlock ? "on" : "off"}; ` +
 						`preview head ${cfg.previewHead} / tail ${cfg.previewTail} (errors ${cfg.errorPreviewTail}); hits ${hitCount}; ${fenceLine}`,
 					"info",

@@ -31,6 +31,8 @@ export interface GuardConfig {
 	errorPreviewTail: number;
 	/** Validate tool-call arguments (paths, numbers, string length) at the tool_call boundary. */
 	argGuard: boolean;
+	/** Block bash when the same command shape has run with no assistant text in between. */
+	streakBlock: boolean;
 }
 
 export const DEFAULT_CONFIG: GuardConfig = {
@@ -43,6 +45,7 @@ export const DEFAULT_CONFIG: GuardConfig = {
 	previewTail: 15,
 	errorPreviewTail: 25,
 	argGuard: true,
+	streakBlock: true,
 };
 
 function positiveInt(raw: string | undefined, fallback: number): number {
@@ -87,6 +90,9 @@ export function loadEnvConfig(env: NodeJS.ProcessEnv = process.env): GuardConfig
 	}
 	if (isFalsey(env.PI_BASH_GUARD_ARG_GUARD)) {
 		cfg.argGuard = false;
+	}
+	if (isFalsey(env.PI_BASH_GUARD_STREAK_BLOCK)) {
+		cfg.streakBlock = false;
 	}
 
 	cfg.maxBytes = nonNegativeInt(env.PI_BASH_GUARD_MAX_BYTES, cfg.maxBytes);
@@ -144,6 +150,13 @@ export function parseCommandArgs(args: string, current: GuardConfig): CommandPar
 				return { kind: "config", config: { ...current, argGuard: value === "on" } };
 			}
 			return { kind: "error", message: `arg expects on|off, got: ${rest[0] ?? "(nothing)"}` };
+		}
+		case "streak": {
+			const value = rest[0]?.toLowerCase();
+			if (value === "on" || value === "off") {
+				return { kind: "config", config: { ...current, streakBlock: value === "on" } };
+			}
+			return { kind: "error", message: `streak expects on|off, got: ${rest[0] ?? "(nothing)"}` };
 		}
 		case "bytes": {
 			const n = Number.parseInt(rest[0] ?? "", 10);
