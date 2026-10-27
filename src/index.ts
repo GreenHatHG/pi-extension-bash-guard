@@ -70,6 +70,7 @@ export function buildDisciplineText(cfg: GuardConfig): string {
 		"Bound output before you run:",
 		"- Content search: use the `grep` tool (`limit` caps matches; it respects .gitignore). In bash, `rg -l` lists matching files only, `-c` counts per file, `-m 5` caps matches per file. Never scan a huge tree unbounded.",
 		"- Read files: use the `read` tool with offset/limit. For spot checks use `sed -n '1,80p' <file>` or `head -n 80 <file>` — not `cat`.",
+		"- Long-line files (session `.jsonl`, minified `dist/bundle`): a line cap is not a byte cap — one line can be several KB. Bound bytes too: `| cut -c1-200 | head -40` or `| head -c 3000`.",
 		"- Logs/lists: `tail -n 50`, `git log --oneline -n 20`, `git diff --stat`, `ls | head`.",
 		"- Aggregate first: `| wc -l`, `| sort | uniq -c`, `-q`/`--quiet`/`-s`. Write big output to a file, then read/grep it selectively.",
 		"",

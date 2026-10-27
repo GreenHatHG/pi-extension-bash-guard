@@ -47,6 +47,18 @@ describe("suggestRewrites", () => {
 		expect(hints[0]).toContain("wc -l");
 	});
 
+	test("A long-line target gets byte advice, not another line cap", () => {
+		// Real cases: a session .jsonl grepped with `| head -40`, and a minified dist/bundle chunk.
+		for (const command of [
+			"grep -n 'spawn_sub' sessions/2026-10-19.jsonl | head -40",
+			"rg -n 'setTheme' dist/bundle/chunks/chunk-JVUZSMYM.js | head -20",
+		]) {
+			const hints = suggestRewrites(command).join(" ");
+			expect(hints).toContain("head -c");
+			expect(hints).toContain("long-line");
+		}
+	});
+
 	test("Returns at most 3 hints", () => {
 		const hints = suggestRewrites("find . -type f | xargs cat | git log");
 		expect(hints.length).toBeLessThanOrEqual(3);

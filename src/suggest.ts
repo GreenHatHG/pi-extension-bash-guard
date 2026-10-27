@@ -17,7 +17,19 @@ const GENERIC_HINT =
 const GIT_LOG_COMMAND =
 	/(^|[\s|;&(])git(?:\s+(?:--no-pager|--paginate|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs)|\s+-C\s+\S+|\s+-c\s+\S+|\s+--(?:config-env|exec-path|git-dir|namespace|super-prefix|work-tree)(?:=\S+|\s+\S+))*\s+log\b/;
 
+/** Targets whose lines are enormous: session transcripts and minified bundle chunks. */
+const LONG_LINE_TARGET = /\.jsonl\b|dist\/bundle|\/chunks\/|\.min\.js\b|sessions\//;
+
 const RULES: Rule[] = [
+	{
+		// Long-line sources first: they are the measured failure mode. Of 105 real guarded commands, the 83
+		// that already had `head`/`tail` ran ~1.6KB per line (36 of them over 2KB), and 19 targeted session
+		// `.jsonl`, 13 minified `dist/bundle` chunks. A line cap cannot fit those under the byte limit.
+		test: (c) => LONG_LINE_TARGET.test(c) && !/\|\s*(head\s+-c|cut\s+-c)/.test(c),
+		hint:
+			"That target is long-line (`.jsonl` / minified bundle): bound bytes, not lines — " +
+			"`| cut -c1-200 | head -40` or `| head -c 3000`. `head -n 40` alone still returns several KB.",
+	},
 	{
 		// cat / less / more / bat: dumps a whole big file
 		test: (c) => /(^|[\s|;&(])(cat|less|more|bat)\s/.test(c) && !/\|\s*(head|tail|sed|awk|rg|grep|wc)\b/.test(c),
