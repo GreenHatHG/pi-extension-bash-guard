@@ -18,6 +18,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { assessOutput, describeLimit } from "./analyze";
 import { validateToolArgs } from "./arg-guard";
+import { buildAuditPrompt } from "./audit";
 import { classifyCommand } from "./classify";
 import { CONFIG_CUSTOM_TYPE, type GuardConfig, loadEnvConfig, parseCommandArgs, readPersistedConfig } from "./config";
 import { buildGuardMessage } from "./guard-message";
@@ -391,11 +392,35 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	// ── /bash-guard config command ─────────────────────────────────────────────────
 	pi.registerCommand("bash-guard", {
 		description:
-			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | hint <on|off> | arg <on|off> | streak <on|off> | bytes <n> | payload <n> | preview <head> [tail])",
+			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | hint <on|off> | arg <on|off> | streak <on|off> | bytes <n> | payload <n> | preview <head> [tail] | audit [all])",
 		handler: async (args, ctx) => {
 			const result = parseCommandArgs(args, cfg);
 			if (result.kind === "error") {
 				ctx.ui.notify(result.message, "error");
+				return;
+			}
+			if (result.kind === "audit") {
+				// The audit is just a user message: the agent scans the session history with its normal
+				// tools (which this very guard polices) and replies with numbered suggestions. We send it
+				// straight away; the user picks one by replying with a number. pi.sendUserMessage is
+				// async and swallows its own errors, so check idle first (pi's own example does this).
+				if (!ctx.isIdle()) {
+					ctx.ui.notify(
+						"bash-guard audit: the agent is busy — wait for the current turn to finish, then retry",
+						"error",
+					);
+					return;
+				}
+				// getSessionDir() is the only reliable source: a custom/CLI session dir is flat, and the
+				// encoded-cwd guess would name a directory that does not exist.
+				pi.sendUserMessage(
+					buildAuditPrompt({
+						cwd: ctx.cwd,
+						scope: result.scope,
+						sessionDir: ctx.sessionManager.getSessionDir(),
+						cfg,
+					}),
+				);
 				return;
 			}
 			if (result.kind === "status") {

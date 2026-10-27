@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { buildAuditPrompt, sessionDirForCwd, sessionsDir } from "../src/audit";
 import { DEFAULT_CONFIG, loadEnvConfig, parseCommandArgs, readPersistedConfig } from "../src/config";
 
 describe("loadEnvConfig", () => {
@@ -114,6 +115,89 @@ describe("parseCommandArgs", () => {
 
 	test("Unknown args error", () => {
 		expect(parseCommandArgs("bogus", DEFAULT_CONFIG).kind).toBe("error");
+	});
+});
+
+describe("audit", () => {
+	test("session dirs are named by cwd: strip leading slash, map / \\ and : to -, wrap in --", () => {
+		expect(sessionDirForCwd("/home/me/proj")).toBe("--home-me-proj--");
+		expect(sessionDirForCwd("/")).toBe("----");
+		expect(sessionDirForCwd("/home/me/a:b")).toBe("--home-me-a-b--");
+		expect(sessionDirForCwd("/home/me/proj/")).toBe("--home-me-proj--");
+		expect(sessionDirForCwd("//home//me/proj")).toBe("--home-me-proj--");
+	});
+
+	test("sessions dir follows the env overrides, default is ~/.pi/agent/sessions", () => {
+		expect(sessionsDir({})).toBe("~/.pi/agent/sessions");
+		expect(sessionsDir({ PI_CODING_AGENT_DIR: "/x/.pi" })).toBe("/x/.pi/sessions");
+		expect(sessionsDir({ PI_CODING_AGENT_SESSION_DIR: "/custom/sessions" })).toBe("/custom/sessions");
+	});
+
+	test("project scope points at the project's session dir; all scope does not", () => {
+		const project = buildAuditPrompt({ cwd: "/home/me/proj", scope: "project", env: {} });
+		expect(project).toContain("~/.pi/agent/sessions/--home-me-proj--");
+		expect(project).toContain("STOP");
+		const all = buildAuditPrompt({ cwd: "/home/me/proj", scope: "all", env: {} });
+		expect(all).toContain("ALL session directories under ~/.pi/agent/sessions");
+		expect(all).not.toContain("--home-me-proj--");
+	});
+
+	test("a flat custom session dir is used as-is, not with an encoded-cwd suffix", () => {
+		// pi writes <custom-dir>/<timestamp>_<id>.jsonl directly; appending --<cwd>-- names a dir that does not exist
+		const env = { PI_CODING_AGENT_SESSION_DIR: "/custom/sessions" };
+		const project = buildAuditPrompt({ cwd: "/home/me/proj", scope: "project", env });
+		expect(project).toContain("the directory /custom/sessions.");
+		expect(project).not.toContain("/custom/sessions/--");
+
+		const all = buildAuditPrompt({ cwd: "/home/me/proj", scope: "all", env });
+		expect(all).toContain("/custom/sessions/*.jsonl");
+	});
+
+	test("the real session dir from pi wins, and a nested one makes `all` scan its parent", () => {
+		const nested = "/root/sessions/--home-me-proj--";
+		expect(buildAuditPrompt({ cwd: "/home/me/proj", scope: "project", sessionDir: nested })).toContain(
+			"the directory /root/sessions/--home-me-proj--.",
+		);
+		expect(buildAuditPrompt({ cwd: "/home/me/proj", scope: "all", sessionDir: nested })).toContain(
+			"/root/sessions/<dir-encoded-cwd>/*.jsonl",
+		);
+
+		const flat = "/root/custom";
+		const project = buildAuditPrompt({ cwd: "/home/me/proj", scope: "project", sessionDir: flat });
+		expect(project).toContain("the directory /root/custom.");
+		expect(project).toContain("/root/custom/*.jsonl");
+		expect(buildAuditPrompt({ cwd: "/home/me/proj", scope: "all", sessionDir: flat })).toContain(
+			"/root/custom/*.jsonl",
+		);
+	});
+
+	test("the prompt states the live thresholds, not the defaults", () => {
+		const prompt = buildAuditPrompt({
+			cwd: "/x",
+			scope: "project",
+			cfg: { ...DEFAULT_CONFIG, maxBytes: 4096, payloadMaxBytes: 0, previewHead: 7 },
+		});
+		expect(prompt).toContain("4.0KB for search/list/dump output, no limit for everything else");
+		expect(prompt).toContain("preview keeps 7 head");
+		expect(prompt).not.toContain("8.0KB");
+	});
+
+	test("the prompt lists every guard marker so the agent can grep them", () => {
+		const prompt = buildAuditPrompt({ cwd: "/x", scope: "all", env: {} });
+		expect(prompt).toContain("[BASH OUTPUT GUARD]");
+		expect(prompt).toContain("[BASH SCAN GUARD]");
+		expect(prompt).toContain("[LOOP GUARD]");
+		expect(prompt).toContain("[ARG GUARD]");
+		expect(prompt).toContain("[BASH TIMEOUT GUARD]");
+		expect(prompt).toContain("[BASH READ-ONLY FENCE]");
+	});
+
+	test("audit [all] parses, bare audit is project-scope, extras are errors", () => {
+		expect(parseCommandArgs("audit", DEFAULT_CONFIG)).toEqual({ kind: "audit", scope: "project" });
+		expect(parseCommandArgs("audit all", DEFAULT_CONFIG)).toEqual({ kind: "audit", scope: "all" });
+		expect(parseCommandArgs("audit ALL", DEFAULT_CONFIG)).toEqual({ kind: "audit", scope: "all" });
+		expect(parseCommandArgs("audit now", DEFAULT_CONFIG).kind).toBe("error");
+		expect(parseCommandArgs("audit all extra", DEFAULT_CONFIG).kind).toBe("error");
 	});
 });
 

@@ -26,13 +26,13 @@
 /** Longest path we'll accept. Real paths top out well under 500; this catches runaways early. */
 export const MAX_PATH_LENGTH = 512;
 /** Most `..` parent segments a sane path climbs before we call it degenerate. */
-const MAX_PARENT_SEGMENTS = 8;
+export const MAX_PARENT_SEGMENTS = 8;
 /** A `/`-segment seen this many times in one path is a runaway repeat (the incident had 1937). */
-const MAX_SEGMENT_OCCURRENCES = 20;
+export const MAX_SEGMENT_OCCURRENCES = 20;
 /** Longest any string argument may be (guards against whole-argument loops). */
 export const MAX_STRING_LENGTH = 50_000;
 /** Longest number argument before we call it nonsense. Timeouts legitimately reach ~2000s, so keep headroom. */
-const MAX_NUMBER = 1_000_000_000;
+export const MAX_NUMBER = 1_000_000_000;
 /**
  * String-valued keys we length-check. These are *instruction* parameters (a command to run, a pattern
  * to match) — a runaway loop there is genuinely degenerate. Keys that carry *payload* (the `content`

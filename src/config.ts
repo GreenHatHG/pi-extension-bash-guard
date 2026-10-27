@@ -108,11 +108,13 @@ export function loadEnvConfig(env: NodeJS.ProcessEnv = process.env): GuardConfig
 export type CommandParseResult =
 	| { kind: "config"; config: GuardConfig }
 	| { kind: "status" }
+	| { kind: "audit"; scope: "project" | "all" }
 	| { kind: "error"; message: string };
 
 /**
  * Parse `/bash-guard` args: empty toggles on/off; `on`/`off`; `status`; `scan <on|off>`;
- * `hint <on|off>`; `bytes <n>`; `payload <n>`; `preview <head> [tail]` (n = 0 means no limit).
+ * `hint <on|off>`; `bytes <n>`; `payload <n>`; `preview <head> [tail]` (n = 0 means no limit);
+ * `audit [all]` builds the history-audit prompt (`all` = every session on the machine).
  */
 export function parseCommandArgs(args: string, current: GuardConfig): CommandParseResult {
 	const tokens = args.trim().split(/\s+/).filter(Boolean);
@@ -189,10 +191,19 @@ export function parseCommandArgs(args: string, current: GuardConfig): CommandPar
 			}
 			return { kind: "config", config: { ...current, previewHead: head, previewTail: tail } };
 		}
+		case "audit": {
+			// `audit all` widens the scan to every session dir; bare `audit` stays on this project only.
+			const scope = rest[0]?.toLowerCase() === "all" ? "all" : "project";
+			const extra = rest[scope === "all" ? 1 : 0];
+			if (extra !== undefined) {
+				return { kind: "error", message: `audit expects no arguments besides optional "all", got: ${extra}` };
+			}
+			return { kind: "audit", scope };
+		}
 		default:
 			return {
 				kind: "error",
-				message: `Unknown /bash-guard argument: ${cmd}. Use: on | off | status | scan <on|off> | hint <on|off> | arg <on|off> | bytes <n> | payload <n> | preview <head> [tail]`,
+				message: `Unknown /bash-guard argument: ${cmd}. Use: on | off | status | scan <on|off> | hint <on|off> | arg <on|off> | bytes <n> | payload <n> | preview <head> [tail] | audit [all]`,
 			};
 	}
 }

@@ -234,6 +234,7 @@ Commands:
 | `/bash-guard bytes 8192` | change the process-output byte limit (`0` = no limit for this tier; use `on`/`off` for the master switch) |
 | `/bash-guard payload 30720` | change the valuable-payload byte limit (`0` = no limit for this tier) |
 | `/bash-guard preview 25 15` | change head/tail preview lines |
+| `/bash-guard audit [all]` | send a history-audit prompt as a user message: the agent scans pi's session jsonl files for guard misses/threshold drift and replies with numbered suggestions; you pick one by replying with its number (nothing is changed automatically). Default scope is the current project's sessions; `all` covers every session on the machine |
 
 Config is saved into the session with `pi.appendEntry` and replayed on resume. Note that `hint off`
 persists with the session: if you later remove the file carrying the same rules (e.g. a global
@@ -305,6 +306,7 @@ Layout:
 ```
 src/index.ts          plugin wiring: events, /bash-guard command, status bar, temp-file lifecycle
 src/config.ts         limit defaults, env seeds, command arg parsing, session-persist replay
+src/audit.ts          the /bash-guard audit prompt: what to scan, how to stay bounded, what to report
 src/analyze.ts        size checks, built-in footer removal, preview trim, repeat folding, signal pickup
 src/classify.ts       command classes: process output / build-test / valuable payload (strict allowlist, word list from claude-code)
 src/suggest.ts        command heuristics -> rewrite hints
