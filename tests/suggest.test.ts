@@ -35,6 +35,18 @@ describe("suggestRewrites", () => {
 		expect(hints[0]).toContain("wc -l");
 	});
 
+	test("A line cap is not a byte cap: `| head -5` still gets the bounding hint", () => {
+		// Real case: `grep -n ... 2>&1 | head -5` returned 2 lines but 30KB — one huge line.
+		const hints = suggestRewrites("grep -n 'x' big.jsonl | head -5").join(" ");
+		expect(hints).toContain("head -c");
+	});
+
+	test("An explicit byte cap is bounded; no search hint", () => {
+		const hints = suggestRewrites("grep -n 'x' big.jsonl | head -c 2000");
+		expect(hints).toHaveLength(1);
+		expect(hints[0]).toContain("wc -l");
+	});
+
 	test("Returns at most 3 hints", () => {
 		const hints = suggestRewrites("find . -type f | xargs cat | git log");
 		expect(hints.length).toBeLessThanOrEqual(3);

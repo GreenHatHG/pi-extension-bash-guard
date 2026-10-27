@@ -33,14 +33,17 @@ const RULES: Rule[] = [
 			"(or `grep --exclude-dir=.git --exclude-dir=node_modules -r`). A trailing `| grep -v dir` still reads every file.",
 	},
 	{
-		// rg / grep with no cap flag
+		// rg / grep with no cap flag. A line cap alone is not a byte cap: `grep ... | head -5` still returned
+		// 2 lines / 30KB in real history, so only an explicit byte cap silences this hint.
 		test: (c) =>
 			/(^|[\s|;&(])(rg|grep)\b/.test(c) &&
 			!/(^|\s)(-l|--files-with-matches|-c|--count|-m|--max-count)(\s|=|\b)/.test(c) &&
-			!/\|\s*(head|tail|wc|sort|uniq)\b/.test(c),
+			!/\|\s*(head|tail)\s+(-c|--bytes)\b/.test(c) &&
+			!/\|\s*(wc|sort|uniq)\b/.test(c),
 		hint:
 			"Cap the search: `rg -l <pattern>` lists matching files only, `-c` counts per file, " +
-			"or `-m 5` / `--max-count=5` caps matches per file.",
+			"or `-m 5` / `--max-count=5` caps matches per file. `| head -N` caps lines, not bytes — one huge " +
+			"line still blows the limit, so bound bytes with `| head -c 2000` when matches can be long.",
 	},
 	{
 		// find with no narrowing

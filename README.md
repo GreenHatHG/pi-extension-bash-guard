@@ -147,7 +147,7 @@ Read it selectively: the `read` tool with offset/limit, or the `grep` tool point
 
 Rewrite the command instead of repeating it. Do NOT re-run the same command, and do NOT just pipe it to
 `less`/`more`. Suggestions:
-  - Cap the search: `rg -l <pattern>` lists matching files only, `-c` counts per file, or `-m 5` / `--max-count=5` caps matches per file.
+  - Cap the search: `rg -l <pattern>` lists matching files only, `-c` counts per file, or `-m 5` / `--max-count=5` caps matches per file. `| head -N` caps lines, not bytes — one huge line still blows the limit, so bound bytes with `| head -c 2000` when matches can be long.
 ```
 
    Sample when "valuable payload" is intercepted (no rewrite lecture):
