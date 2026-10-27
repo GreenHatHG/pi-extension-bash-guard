@@ -114,7 +114,8 @@ export type CommandParseResult =
 /**
  * Parse `/bash-guard` args: empty toggles on/off; `on`/`off`; `status`; `scan <on|off>`;
  * `hint <on|off>`; `bytes <n>`; `payload <n>`; `preview <head> [tail]` (n = 0 means no limit);
- * `audit [all]` builds the history-audit prompt (`all` = every session on the machine).
+ * `audit [project]` builds the history-audit prompt (default = every session on the machine;
+ * `project` narrows it to this project's sessions).
  */
 export function parseCommandArgs(args: string, current: GuardConfig): CommandParseResult {
 	const tokens = args.trim().split(/\s+/).filter(Boolean);
@@ -192,13 +193,18 @@ export function parseCommandArgs(args: string, current: GuardConfig): CommandPar
 			return { kind: "config", config: { ...current, previewHead: head, previewTail: tail } };
 		}
 		case "audit": {
-			// `audit all` widens the scan to every session dir; bare `audit` stays on this project only.
-			const scope = rest[0]?.toLowerCase() === "all" ? "all" : "project";
-			const extra = rest[scope === "all" ? 1 : 0];
-			if (extra !== undefined) {
-				return { kind: "error", message: `audit expects no arguments besides optional "all", got: ${extra}` };
+			// Default is the whole agent history: a guard tuned on one project misses how it behaves elsewhere.
+			const arg = rest[0]?.toLowerCase();
+			if (arg !== undefined && arg !== "all" && arg !== "project") {
+				return {
+					kind: "error",
+					message: `audit expects no arguments besides optional "project", got: ${rest[0]}`,
+				};
 			}
-			return { kind: "audit", scope };
+			if (rest[1] !== undefined) {
+				return { kind: "error", message: `audit expects no arguments besides optional "project", got: ${rest[1]}` };
+			}
+			return { kind: "audit", scope: arg === "project" ? "project" : "all" };
 		}
 		default:
 			return {

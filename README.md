@@ -234,7 +234,7 @@ Commands:
 | `/bash-guard bytes 8192` | change the process-output byte limit (`0` = no limit for this tier; use `on`/`off` for the master switch) |
 | `/bash-guard payload 30720` | change the valuable-payload byte limit (`0` = no limit for this tier) |
 | `/bash-guard preview 25 15` | change head/tail preview lines |
-| `/bash-guard audit [all]` | send a history-audit prompt as a user message: the agent scans pi's session jsonl files for guard misses/threshold drift and replies with numbered suggestions; you pick one by replying with its number (nothing is changed automatically). Default scope is the current project's sessions; `all` covers every session on the machine |
+| `/bash-guard audit [project]` | send a history-audit prompt as a user message: the agent scans pi's session jsonl files for guard misses/threshold drift and replies with numbered suggestions; you pick one by replying with its number (nothing is changed automatically). Default scope is every session on the machine (the whole Pi Coding Agent history); `project` narrows it to the current project's sessions |
 
 Config is saved into the session with `pi.appendEntry` and replayed on resume. Note that `hint off`
 persists with the session: if you later remove the file carrying the same rules (e.g. a global

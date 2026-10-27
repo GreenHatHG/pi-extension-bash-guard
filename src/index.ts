@@ -392,7 +392,7 @@ export default function bashGuardExtension(pi: ExtensionAPI): void {
 	// ── /bash-guard config command ─────────────────────────────────────────────────
 	pi.registerCommand("bash-guard", {
 		description:
-			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | hint <on|off> | arg <on|off> | streak <on|off> | bytes <n> | payload <n> | preview <head> [tail] | audit [all])",
+			"Toggle or configure the bash output guard (on | off | status | scan <on|off> | hint <on|off> | arg <on|off> | streak <on|off> | bytes <n> | payload <n> | preview <head> [tail] | audit [project])",
 		handler: async (args, ctx) => {
 			const result = parseCommandArgs(args, cfg);
 			if (result.kind === "error") {

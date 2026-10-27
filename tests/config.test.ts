@@ -201,12 +201,15 @@ describe("audit", () => {
 		expect(caveat).toContain("begins");
 	});
 
-	test("audit [all] parses, bare audit is project-scope, extras are errors", () => {
-		expect(parseCommandArgs("audit", DEFAULT_CONFIG)).toEqual({ kind: "audit", scope: "project" });
+	test("audit defaults to the whole agent history; `audit project` narrows, extras are errors", () => {
+		expect(parseCommandArgs("audit", DEFAULT_CONFIG)).toEqual({ kind: "audit", scope: "all" });
 		expect(parseCommandArgs("audit all", DEFAULT_CONFIG)).toEqual({ kind: "audit", scope: "all" });
 		expect(parseCommandArgs("audit ALL", DEFAULT_CONFIG)).toEqual({ kind: "audit", scope: "all" });
+		expect(parseCommandArgs("audit project", DEFAULT_CONFIG)).toEqual({ kind: "audit", scope: "project" });
+		expect(parseCommandArgs("audit PROJECT", DEFAULT_CONFIG)).toEqual({ kind: "audit", scope: "project" });
 		expect(parseCommandArgs("audit now", DEFAULT_CONFIG).kind).toBe("error");
 		expect(parseCommandArgs("audit all extra", DEFAULT_CONFIG).kind).toBe("error");
+		expect(parseCommandArgs("audit project extra", DEFAULT_CONFIG).kind).toBe("error");
 	});
 });
 
