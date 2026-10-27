@@ -192,6 +192,15 @@ describe("audit", () => {
 		expect(prompt).toContain("[BASH READ-ONLY FENCE]");
 	});
 
+	test("the prompt says only a line-start marker counts, so source-code hits are not counted", () => {
+		// Reading this repo's own source/tests prints the marker strings; an audit that greps blindly
+		// counted 27 hits in files where only 3 were real interventions.
+		const prompt = buildAuditPrompt({ cwd: "/x", scope: "project", env: {} });
+		expect(prompt).toContain("a reference, not an intervention");
+		const caveat = prompt.split("\n").find((line) => line.includes("a reference, not an intervention"));
+		expect(caveat).toContain("begins");
+	});
+
 	test("audit [all] parses, bare audit is project-scope, extras are errors", () => {
 		expect(parseCommandArgs("audit", DEFAULT_CONFIG)).toEqual({ kind: "audit", scope: "project" });
 		expect(parseCommandArgs("audit all", DEFAULT_CONFIG)).toEqual({ kind: "audit", scope: "all" });

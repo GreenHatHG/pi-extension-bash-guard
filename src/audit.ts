@@ -149,6 +149,7 @@ export function buildAuditPrompt(input: AuditInput): string {
 		"- Guard interventions appear as markers inside that toolResult text:",
 		markers,
 		"- Counting caveat: the markers also show up outside toolResult text — in the session-start custom message, in blocked tool calls for other tools (ARG GUARD), and quoted in assistant prose. Count per entry, not per raw file grep, or you will over-count.",
+		"- Second caveat: a marker is an intervention only when it *begins* the toolResult text or one of its lines (guard messages and block reasons do; the timeout hint is appended as its own line). A marker in the middle of a line is a grep hit on this repo's source, tests or docs — a reference, not an intervention.",
 		"- Guard config appears as `custom` entries with customType `bash-guard-config`.",
 		"",
 		"How to scan — the guard applies to your own commands too, so aggregate before you look:",
