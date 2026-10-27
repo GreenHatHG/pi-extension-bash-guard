@@ -31,8 +31,11 @@ Five things (the loop guard, the arg guard, and the fence are hard; the hint and
 3. **Cap search commands at 5 minutes (hard)**: at `tool_call`, for search commands (`find`, any
    `grep`, `rg`, `du`, `tree`) with no `timeout` or a value over 300 seconds, rewrite `input.timeout` in
    place to **300**; a smaller model-set value is respected (300 is a ceiling, not an override).
-   Non-search commands are **left completely alone** — long runners like `tail -f`/`watch`/foreground
-   servers keep going.
+   A search program that only **filters a pipe** does not count — `pre-commit run --all-files 2>&1 |
+   grep -E "Failed|error"` reads stdin, not a tree, and its producer is what needs the time (real case:
+   a deliberate `timeout 600` was pulled to 300s and killed mid-run). Only a segment that starts on its
+   own (`;`, `&&`, `||`, newline) is a scan worth capping. Non-search commands are **left completely
+   alone** — long runners like `tail -f`/`watch`/foreground servers keep going.
 3.5. **Catch silent same-shape death loops (hard)**: at `tool_call`, reduce the command to a shape
    (program + subcommand, variable args dropped, `cd dir && …` chains judged by the real command) and
    walk the session branch backwards: if the same shape has fired **35 times in a row with no
@@ -288,6 +291,10 @@ process it shows `🛡 read-only` and `🛡 read-only ×N` (fence blocks only).
   `timeout` to 300 seconds takes effect right away with no extra "block → resend" round trip; and it's
   a ceiling — a smaller model-set budget is used as is. The cost is the model may not know it was
   capped, but the `[BASH TIMEOUT GUARD]` error hint covers that on a hit.
+- **Why a pipe-fed search is exempt from the cap**: the cap is about a tree walk, and `producer | grep`
+  walks nothing — the producer is the long part, and it is not a search command. Audit of the full
+  session history: 829 of 4,091 search-bearing commands were pipe-fed filters only, and one of them was
+  killed mid-run after a deliberate `timeout 600` got pulled to 300s.
 - **Why leave all other commands alone**: `tail -f`/`watch`/foreground servers are meant to run long;
   hard-blocking would only push the model to write `timeout: 999999` and bypass it. Putting the limit
   only on "search" — the one class with a definite bounded need — keeps friction lowest.

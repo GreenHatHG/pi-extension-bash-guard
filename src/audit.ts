@@ -110,7 +110,7 @@ function tunables(cfg: GuardConfig): string[] {
 	return [
 		`- Output limits: ${bytes} for search/list/dump output, ${payload} for everything else; preview keeps ${cfg.previewHead} head + ${cfg.previewTail} tail lines (${cfg.errorPreviewTail} tail when the command fails).`,
 		`- Switches: master ${onOff(cfg.enabled)}, opening hint ${onOff(cfg.hint)}, pre-scan block ${onOff(cfg.scanBlock)}, arg guard ${onOff(cfg.argGuard)}, loop breaker ${onOff(cfg.streakBlock)}.`,
-		`- Search commands (find/grep/rg/du/tree) are capped at a ${SEARCH_TIMEOUT_SECONDS}s timeout; scans rooted at $HOME, /, or a system dir are blocked before they run.`,
+		`- Search commands (find/grep/rg/du/tree) are capped at a ${SEARCH_TIMEOUT_SECONDS}s timeout, unless the search only filters a pipe (\`producer | grep\`); scans rooted at $HOME, /, or a system dir are blocked before they run.`,
 		`- Loop breaker: same command shape ${STREAK_BLOCK_AT} times in a row with no assistant text in between → blocked.`,
 		`- Arg guard on every tool call: path > ${MAX_PATH_LENGTH} chars, > ${MAX_PARENT_SEGMENTS} \`..\` segments, one path segment repeated ${MAX_SEGMENT_OCCURRENCES}+ times; numbers NaN/negative/>${MAX_NUMBER}; string instruction > ${MAX_STRING_LENGTH} chars.`,
 	];

@@ -66,3 +66,28 @@ describe("searchTimeoutInjection — caps search commands at 5 minutes", () => {
 		);
 	});
 });
+
+describe("a search program that only filters a pipe is not the workload", () => {
+	// Real case: pi-kitmux 2026-10-26T08-15-44-560Z, a deliberately long pre-commit run was pulled to
+	// 300s and killed mid-run because a trailing `| grep` made the whole command count as a scan.
+	const preCommitPipe =
+		'cd /home/jooooody0710/projects/pi-kitmux && timeout 600 env PRE_COMMIT_HOME="$PWD/cache" ' +
+		'uv run pre-commit run --all-files 2>&1 | grep -E "Failed|error" | head -10';
+
+	test("a long build piped into grep keeps its own budget", () => {
+		expect(inject(preCommitPipe)).toBeNull();
+	});
+
+	test("stdin-fed grep is not a scan, but a standalone grep in the same command is", () => {
+		expect(inject("cat log.txt | grep -n error")).toBeNull();
+		expect(inject("cat log.txt | grep -n error; grep -rn error src")).toBe(SEARCH_TIMEOUT_SECONDS);
+	});
+
+	test("`||` is a fallback, not a pipe: the search still runs against files", () => {
+		expect(inject("rg foo src || echo none")).toBe(SEARCH_TIMEOUT_SECONDS);
+	});
+
+	test("a pipe inside a quoted pattern does not make the command a filter", () => {
+		expect(inject('rg -n "a|b" src')).toBe(SEARCH_TIMEOUT_SECONDS);
+	});
+});

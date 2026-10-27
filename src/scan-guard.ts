@@ -151,6 +151,18 @@ export interface ParsedScan {
 	recursive: boolean;
 	/** Scan root operands (pattern already removed for grep/rg). */
 	roots: string[];
+	/**
+	 * Whether the segment this scan sits in is fed by a pipe (`build | grep -E "FAIL"`). Such a scan only
+	 * filters another program's output, so it is not the workload the timeout cap is meant for.
+	 */
+	piped: boolean;
+}
+
+/** One command segment plus how it was fed. */
+export interface SplitSegment {
+	text: string;
+	/** Preceded by a pipe (`|` or `|&`) — its stdin comes from the previous segment. */
+	piped: boolean;
 }
 
 /** Take a path's basename, to catch absolute calls like `/usr/bin/grep`. */
@@ -165,8 +177,20 @@ export function basename(token: string): string {
  * descriptor duplication (`2>&1`) is not a separator and stays in its segment.
  */
 export function splitSegments(command: string): string[] {
-	const segments: string[] = [];
+	return splitSegmentsDetailed(command).map((segment) => segment.text);
+}
+
+/**
+ * Same split as {@link splitSegments}, but each segment also records whether a pipe fed it.
+ *
+ * Only a real pipe counts (`|`, or bash's `|&`); `||` is an or-branch and runs standalone with no
+ * stdin, so `rg foo || echo none` keeps its cap. Consecutive separators keep the pending flag:
+ * the second `|` of `||` and the `&` of `|&` must not clear it.
+ */
+export function splitSegmentsDetailed(command: string): SplitSegment[] {
+	const segments: SplitSegment[] = [];
 	let current = "";
+	let currentPiped = false;
 	let quote: "'" | '"' | null = null;
 	for (let i = 0; i < command.length; i++) {
 		const ch = command[i];
@@ -203,13 +227,16 @@ export function splitSegments(command: string): string[] {
 				current += ch;
 				continue;
 			}
-			if (current.trim() !== "") segments.push(current);
+			if (current.trim() !== "") {
+				segments.push({ text: current, piped: currentPiped });
+				currentPiped = ch === "|" && command[i + 1] !== "|" && command[i - 1] !== "|";
+			}
 			current = "";
 			continue;
 		}
 		current += ch;
 	}
-	if (current.trim() !== "") segments.push(current);
+	if (current.trim() !== "") segments.push({ text: current, piped: currentPiped });
 	return segments;
 }
 
@@ -638,23 +665,23 @@ export function parseScanCommands(command: string, depth = 0): ParsedScan[] {
 	if (!command || depth > 8) return out;
 	for (const nested of extractNestedCommands(command)) out.push(...parseScanCommands(nested, depth + 1));
 	for (const words of extractForWordLists(command)) out.push(...parseScanCommands(words, depth + 1));
-	for (const segment of splitSegments(command)) {
-		const tokens = stripWrappers(tokenizeSegment(stripRedirections(segment)));
+	for (const segment of splitSegmentsDetailed(command)) {
+		const tokens = stripWrappers(tokenizeSegment(stripRedirections(segment.text)));
 		if (tokens.length === 0) continue;
 		const tool = basename(tokens[0]);
 		const args = tokens.slice(1);
 		if (tool === "find") {
-			out.push({ tool, recursive: true, roots: findRoots(args) });
+			out.push({ tool, recursive: true, roots: findRoots(args), piped: segment.piped });
 		} else if (tool === "grep" || tool === "egrep" || tool === "fgrep") {
 			// Every grep is parsed (roots + recursion flag); the block check skips non-recursive ones,
 			// but the timeout cap covers them all — see `searchTimeoutInjection`.
-			out.push({ tool, ...grepRoots(args) });
+			out.push({ tool, ...grepRoots(args), piped: segment.piped });
 		} else if (tool === "rg") {
 			const { roots } = rgRoots(args);
-			out.push({ tool, recursive: true, roots });
+			out.push({ tool, recursive: true, roots, piped: segment.piped });
 		} else if (tool === "du" || tool === "tree") {
 			const valueFlags = tool === "du" ? DU_VALUE_FLAGS : TREE_VALUE_FLAGS;
-			out.push({ tool, recursive: true, roots: plainRoots(args, valueFlags) });
+			out.push({ tool, recursive: true, roots: plainRoots(args, valueFlags), piped: segment.piped });
 		}
 	}
 	return out;
