@@ -25,9 +25,12 @@ Five things (the loop guard, the arg guard, and the fence are hard; the hint and
    `find`/`grep -r`/`rg`/`du`/`tree`. If it's `$HOME` (including `~`, `$HOME`, `${HOME}`, a literal home
    path), `/`, or an exact system dir (`/etc`, `/var`, `/usr`, `/System`, `/Library`, `/Applications`,
    `/opt`, `/private`, `/bin`, `/sbin`, `/dev`, `/proc`), **block it** and return narrowing hints
-   (`rg -l <pattern> ~/Projects`, `mdfind -name '<name>'`, or add `-g '!Library/**'`). Deeper subdirs
+   (`rg -l <pattern> ~/Projects`, `mdfind -name '<name>'`, `command -v <name>` / `npm ls -g` when looking for
+   an executable, or add `-g '!Library/**'`). Deeper subdirs
    (`/etc/nginx`, `~/Library/Preferences`) always pass. Why: these commands produce almost no output,
    so the byte guard can't catch them at all, yet they walk tens of GB (a real incident took 934 seconds).
+   The executable line exists because 24 of 51 real blocks were `find / -name tsc` / `find ~ -name
+   '*enclave*'` lookups, which the byte guard also can't see and `mdfind` alone doesn't answer on Linux.
 3. **Cap search commands at 5 minutes (hard)**: at `tool_call`, for search commands (`find`, any
    `grep`, `rg`, `du`, `tree`) with no `timeout` or a value over 300 seconds, rewrite `input.timeout` in
    place to **300**; a smaller model-set value is respected (300 is a ceiling, not an override).

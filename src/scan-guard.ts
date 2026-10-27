@@ -705,6 +705,7 @@ export function buildScanReason(tool: string, root: string, kind: ScanKind): str
 		"Scope it instead:",
 		"- Code search: `rg -l <pattern> <project-dir>` (rg is fast and respects .gitignore); add `-g '!**/node_modules/**'` if needed.",
 		"- Find by name: `mdfind -name '<name>'` (macOS Spotlight index, near-instant).",
+		"- Find an executable: `command -v <name>` / `type -a <name>`; for a global package: `npm root -g`, `npm ls -g --depth=0`, `ls /usr/lib/node_modules`.",
 		fallback,
 		"Re-issue a scoped command.",
 	].join("\n");

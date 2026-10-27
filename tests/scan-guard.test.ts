@@ -223,6 +223,13 @@ describe("detectBlockedScan — message text", () => {
 		expect(result?.reason).toContain("/etc");
 		expect(result?.reason).toContain("-maxdepth 2");
 	});
+
+	test("names a way to locate an executable without walking the tree", () => {
+		// 24 of 51 real blocks were `find / -name <binary>` / `find ~ -name '*pkg*'`.
+		const result = detectBlockedScan("find / -maxdepth 6 -name tsc -type f 2>/dev/null | head", opts);
+		expect(result?.reason).toContain("command -v");
+		expect(result?.reason).toContain("npm ls -g");
+	});
 });
 
 describe("detectBlockedScan — real-incident regression", () => {
