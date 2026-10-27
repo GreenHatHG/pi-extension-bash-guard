@@ -103,6 +103,9 @@ describe("detectBlockedScan — blocks the filesystem root /", () => {
 
 	test("With redirection and 2>&1", () => {
 		expect(hit("rg foo / 2>&1 | head")).toBe("rg / root");
+		// Descriptor duplication is not a separator, with or without spaces around the pipe.
+		expect(hit("rg foo / 2>&1|head")).toBe("rg / root");
+		expect(hit("rg foo / 1>&2 | head")).toBe("rg / root");
 	});
 
 	test("rg inside command substitution can't dodge the root block", () => {

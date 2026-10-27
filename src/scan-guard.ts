@@ -161,7 +161,8 @@ export function basename(token: string): string {
 
 /**
  * Split segments on `;` `&` `|` and newlines, quote-aware — a `"a\|b"` (grep alternation) inside
- * double quotes must not count as a pipe. Backslash-escaped chars don't split either.
+ * double quotes must not count as a pipe. Backslash-escaped chars don't split either. The `&` of a
+ * descriptor duplication (`2>&1`) is not a separator and stays in its segment.
  */
 export function splitSegments(command: string): string[] {
 	const segments: string[] = [];
@@ -195,6 +196,13 @@ export function splitSegments(command: string): string[] {
 			continue;
 		}
 		if (ch === ";" || ch === "&" || ch === "|" || ch === "\n") {
+			// `2>&1` / `>&2` duplicates a descriptor, it does not separate commands. Splitting there left a
+			// stray `1` segment, so `grep ... 2>&1 | head` classified as unknown and got the 30KB limit
+			// (real case: 2 lines / 30KB slipped through while the same command without `2>&1` was capped).
+			if (ch === "&" && command[i - 1] === ">") {
+				current += ch;
+				continue;
+			}
 			if (current.trim() !== "") segments.push(current);
 			current = "";
 			continue;

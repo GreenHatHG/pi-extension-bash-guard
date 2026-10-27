@@ -68,6 +68,16 @@ describe("classifyCommand", () => {
 		expect(classifyCommand("rg -n foo . > /tmp/out.txt")).toBe("exhaust");
 	});
 
+	test("Descriptor duplication (2>&1) is not a command separator", () => {
+		// Real case: `grep -o ... 2>&1 | grep -i x | head -30` returned 29KB, and
+		// `grep -n ... 2>&1 | head -5` returned 2 lines / 30KB — both under the wide payload limit
+		// because the split left a stray `1` segment. Same commands without `2>&1` were capped.
+		expect(classifyCommand("rg foo . 2>&1 | head -20")).toBe("exhaust");
+		expect(classifyCommand("rg foo . 2>&1|head")).toBe("exhaust");
+		expect(classifyCommand("rg foo . 1>&2 | head -20")).toBe("exhaust");
+		expect(classifyCommand("grep -n foo f.jsonl 2>&1 | head -5")).toBe("exhaust");
+	});
+
 	test("A leading assignment is setting a variable, not an unknown command", () => {
 		// Real case: `f=chunk.js; rg -n 'x|y' $f | head -20` was 30KB, because `f=...` counted as a command.
 		expect(classifyCommand("f=/tmp/chunk.js; rg -n 'a|b' $f | head -20")).toBe("exhaust");
