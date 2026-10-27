@@ -2,10 +2,12 @@ import { describe, expect, test } from "vitest";
 import {
 	detectBlockedScan,
 	extractForWordLists,
+	maskHeredocBodies,
 	splitCommandSubstitutions,
 	stripRedirections,
 	tokenizeSegment,
 } from "../src/scan-guard";
+import { isSearchCommand } from "../src/timeout-guard";
 
 const HOME = "/Users/tester";
 const opts = { home: HOME };
@@ -240,5 +242,259 @@ describe("detectBlockedScan — real-incident regression", () => {
 		const result = detectBlockedScan(incident, opts);
 		expect(result?.tool).toBe("grep");
 		expect(result?.kind).toBe("home");
+	});
+});
+
+describe("heredoc bodies are data, not commands", () => {
+	// Real incident, twice in one session: a commit message that quoted `find / -name tsc` was blocked
+	// as a filesystem scan, because the body was parsed as if the shell would run it.
+	test("prose inside a quoted heredoc is not a scan", () => {
+		const commit = `git commit -F - <<'EOF'\nfix: say the thing\n\nThe blocks were \`find / -name tsc\` lookups.\nEOF`;
+		expect(hit(commit)).toBeNull();
+	});
+
+	test("a body line that looks like a scan is not a scan", () => {
+		expect(hit("cat > /tmp/notes.md <<'EOF'\nfind / -name tsc\nEOF")).toBeNull();
+	});
+
+	test("a real scan after the heredoc still blocks", () => {
+		// 46 archived commands were capped (or blocked) only because of heredoc text.
+		expect(hit(`cat > /tmp/a.txt <<'EOF'\nnotes\nEOF\nrg -rn foo ${HOME}`)).toBe(`rg ${HOME} home`);
+	});
+
+	test("a body fed to a shell is still judged (it is a script)", () => {
+		for (const command of [
+			"bash <<'EOF'\nfind / -name x\nEOF",
+			"ssh host <<EOF\nfind / -name x\nEOF",
+			"{ bash; } <<'EOF'\nfind / -name x\nEOF",
+			"! bash <<'EOF'\nfind / -name x\nEOF",
+			"then bash <<'EOF'\nfind / -name x\nEOF",
+			"(bash <<'EOF'\nfind / -name x\nEOF\n)",
+			"sudo -u root bash <<'EOF'\nfind / -name x\nEOF",
+			// Long / clustered runner flags: eating the next token would hide `bash`.
+			"sudo --user root bash <<'EOF'\nfind / -name x\nEOF",
+			"sudo -Eu root bash <<'EOF'\nfind / -name x\nEOF",
+			"sudo -E bash <<'EOF'\nfind / -name x\nEOF",
+			"env -i bash <<'EOF'\nfind / -name x\nEOF",
+			"env --unset NOPE bash <<'EOF'\nfind / -name x\nEOF",
+			// A runner in front of the shell is still a shell.
+			"timeout 30 bash <<'EOF'\nfind / -name x\nEOF",
+			"timeout --signal KILL 5 bash <<'EOF'\nfind / -name x\nEOF",
+			"setsid bash <<'EOF'\nfind / -name x\nEOF",
+			"su - login <<'EOF'\nfind / -name x\nEOF",
+			"$SHELL <<'EOF'\nfind / -name x\nEOF",
+			"eval bash <<'EOF'\nfind / -name x\nEOF",
+			"f() { bash; } <<'EOF'\nfind / -name x\nEOF",
+			// A `\\`-continued opening line puts the shell on the first physical line.
+			"bash \\\n<<'EOF'\nfind / -name x\nEOF",
+			// Redirect first, program after the delimiter.
+			"<<'EOF' bash\nfind / -name x\nEOF",
+		]) {
+			expect(hit(command), command).toBe("find / root");
+		}
+	});
+
+	test("a body piped into a shell is still judged", () => {
+		// `cat <<EOF | bash` hands the body to bash as stdin: it runs.
+		for (const command of [
+			"cat <<'EOF' | bash\nfind / -name x\nEOF",
+			"cat <<'EOF' |bash\nfind / -name x\nEOF",
+			"cat<<'EOF'|bash\nfind / -name x\nEOF",
+			"true &&bash <<'EOF'\nfind / -name x\nEOF",
+			"true ;bash <<'EOF'\nfind / -name x\nEOF",
+			"cat <<'EOF' | sudo sh\nfind / -name x\nEOF",
+			"cat <<'EOF' | (bash)\nfind / -name x\nEOF",
+			"cat <<'EOF' | timeout 30 bash\nfind / -name x\nEOF",
+			"cat <<'EOF' |& bash\nfind / -name x\nEOF",
+			"cat <<'EOF' | $BASH\nfind / -name x\nEOF",
+		]) {
+			expect(hit(command), command).toBe("find / root");
+		}
+	});
+
+	test("other shell names and the fd-0 redirect are not blind spots", () => {
+		for (const command of [
+			"rzsh <<'EOF'\nfind / -name x\nEOF",
+			"mksh <<'EOF'\nfind / -name x\nEOF",
+			"yash <<'EOF'\nfind / -name x\nEOF",
+			"posh <<'EOF'\nfind / -name x\nEOF",
+			"$BASH <<'EOF'\nfind / -name x\nEOF",
+			// Braced variables: stripping the `}` before comparing used to lose these.
+			"$" + "{BASH} <<'EOF'\nfind / -name x\nEOF",
+			"$" + "{SHELL} <<'EOF'\nfind / -name x\nEOF",
+			// `$'bash'` normalises to `$bash`.
+			"$'bash' <<'EOF'\nfind / -name x\nEOF",
+			"source /dev/stdin <<'EOF'\nfind / -name x\nEOF",
+			// POSIX `.` is `source`.
+			". /dev/stdin <<'EOF'\nfind / -name x\nEOF",
+			"cat <<'EOF' | . /dev/stdin\nfind / -name x\nEOF",
+			// `0<<'EOF'` feeds descriptor 0, which a later command can read.
+			"exec 0<<'EOF'\nfind / -name x\nEOF",
+		]) {
+			expect(hit(command), command).toBe("find / root");
+		}
+	});
+
+	test("a newline inside a quoted argument keeps the opening line open", () => {
+		// bash keeps reading, so the line after the in-quote newline is still this command.
+		expect(hit(`cat <<'EOF' "multi\nline"\nrg -rn foo ${HOME}`)).toBe(`rg ${HOME} home`);
+	});
+
+	test("a substitution spanning a newline keeps the opening line open", () => {
+		// `$( … )` and backticks run across newlines, so what follows is still command text.
+		expect(hit(`cat <<'EOF' $(echo a\nfind / -name x)\nBODY\nEOF`)).toBe("find / root");
+		expect(hit(`cat <<'EOF' \`echo a\nfind / -name x\`\nBODY\nEOF`)).toBe("find / root");
+	});
+
+	test("a shell that consumes the body from after it is still judged", () => {
+		// The consumer can be named after the body: braces, a subshell, a function, or a process substitution.
+		for (const command of [
+			"{ cat <<'EOF'\nfind / -name x\nEOF\n} | bash",
+			"( cat <<'EOF'\nfind / -name x\nEOF\n) | bash",
+			"f() { cat <<'EOF'\nfind / -name x\nEOF\n; } ; f | bash",
+			"cat <<'EOF' | tee >(bash)\nfind / -name x\nEOF",
+			"cat <<'EOF' > >(bash)\nfind / -name x\nEOF",
+			// Blank, comment and continuation lines between the body and the consumer still belong to it.
+			"{\ncat <<'EOF'\nfind / -name x\nEOF\n\n} | bash",
+			"{\ncat <<'EOF'\nfind / -name x\nEOF\n# feed it\n} | bash",
+			"{\ncat <<'EOF'\nfind / -name x\nEOF\n} \\\n| bash",
+		]) {
+			expect(hit(command), command).toBe("find / root");
+		}
+	});
+
+	test("sudo's own shell flags mean the body is a root script", () => {
+		for (const command of [
+			"sudo -s <<'EOF'\nfind / -name x\nEOF",
+			"sudo -i <<'EOF'\nfind / -name x\nEOF",
+			"sudo --shell <<'EOF'\nfind / -name x\nEOF",
+		]) {
+			expect(hit(command), command).toBe("find / root");
+		}
+	});
+
+	test("an unquoted body keeps what really runs, even inside quote characters", () => {
+		// In a heredoc body, `'…'` is literal bytes: bash still expands `$(...)` inside it, so a
+		// quote-aware scan of the body would drop a command that really runs.
+		for (const command of [
+			"cat <<EOF\nx\n'$(find / -name tsc)'\nEOF",
+			'cat <<EOF\nx\n"$(find / -name tsc)"\nEOF',
+			"git commit -F - <<EOF\ndocs: don't run $(find / -name tsc) here\nEOF",
+			"cat <<EOF\nrun `find / -name tsc`\nEOF",
+		]) {
+			expect(hit(command), command).toBe("find / root");
+		}
+	});
+
+	test("an escaped expansion in a body is literal, and a quoted delimiter expands nothing", () => {
+		expect(hit("cat <<EOF\ncost \\$(find / -name tsc)\nEOF")).toBeNull();
+		expect(hit("cat <<'EOF'\nExample: $(find / -name tsc)\nEOF")).toBeNull();
+	});
+
+	test("a descriptor heredoc keeps its body judged but is skipped as a body", () => {
+		// `2<<EOF` is a descriptor redirect, so the prose inside it is data… but a later `<<X` in that
+		// prose must not pair with an `X` line and swallow a real command.
+		expect(hit("cat 2<<EOF\nexample: cat <<X\nEOF\nfind / -name tsc\nX")).toBe("find / root");
+		expect(hit("exec 0<<'EOF'\nfind / -name tsc\nEOF")).toBe("find / root");
+	});
+
+	test("multiple heredocs on one line: the last body is the one that runs", () => {
+		// `bash <<A <<B` feeds only B to bash, so B's body must be judged, not masked away.
+		for (const command of [
+			"bash <<'A' <<'B'\nprose\nA\nfind / -name x\nB",
+			"bash <<'A' <<'B' <<'C'\nx\nA\ny\nB\nfind / -name x\nC",
+			"sudo bash <<'A' <<'B'\nprose\nA\nfind / -name x\nB",
+		]) {
+			expect(hit(command), command).toBe("find / root");
+		}
+	});
+
+	test("a group's consumer is found past an intervening command line", () => {
+		for (const command of [
+			"{ cat <<'EOF'\nfind / -name x\nEOF\necho \"extra\"\n} | bash",
+			"( cat <<'EOF'\nfind / -name x\nEOF\ntrue\n) | bash",
+			"{ cat <<'EOF'\nfind / -name x\nEOF\ntrue\n} | env bash",
+		]) {
+			expect(hit(command), command).toBe("find / root");
+		}
+	});
+
+	test("an apostrophe in a comment does not open a quote", () => {
+		// Pre-existing leak: `# don't` swallowed every later command in the outer parse.
+		expect(hit("echo hi # don't\nfind / -name x")).toBe("find / root");
+	});
+
+	test("blank and comment lines between a pipe and its filter keep the pipe", () => {
+		// Real pipeline in bash: the producer's output still reaches the filter.
+		expect(isSearchCommand("printf 'x' |\n# why\n\ngrep x")).toBe(false);
+		expect(isSearchCommand("cat log.txt |\n\n# why\n\ngrep -n error")).toBe(false);
+		// The producer is a search itself, so that one still gets the cap.
+		expect(isSearchCommand("rg foo src |\n\nhead")).toBe(true);
+	});
+
+	test("a data heredoc keeps its mask when the next line is an ordinary command", () => {
+		expect(hit(`git commit -F - <<'EOF'\nmessage\nEOF\nnpm test`)).toBeNull();
+		expect(maskHeredocBodies(`git commit -F - <<'EOF'\nmessage\nEOF\nnpm test`)).not.toContain("message");
+	});
+
+	test("a shell word before an in-quote newline is still seen", () => {
+		// `bash -s` reads the heredoc as its script; the header must include the line the word is on.
+		expect(hit("bash -s 'a\nb' <<'EOF'\nfind / -name x\nEOF")).toBe("find / root");
+	});
+
+	test("a length expansion in the header is not a comment", () => {
+		// The `#` of `${#x}` used to start a "comment", so the `${` counter never closed and every
+		// later heredoc was ignored — including the one whose body is real command text.
+		expect(hit(`x=abc\necho ${"$"}{#x} <<'EOF'\n{"a": 1}\nEOF\nrg -rn foo ${HOME}`)).toBe(`rg ${HOME} home`);
+	});
+
+	test("a `\\`-continued opening line does not become part of the body", () => {
+		// Real bash starts the body after the *logical* line, so the continuation line is command text.
+		expect(hit(`cat <<'EOF' \\\n&& rg -rn foo ${HOME}\nBODY\nEOF`)).toBe(`rg ${HOME} home`);
+	});
+
+	test("prose in one body cannot leak quote state into the next heredoc", () => {
+		// An ordinary apostrophe in the first body used to hide the second body's operator, so the second
+		// body was parsed and hard-blocked.
+		const command =
+			"cat > /tmp/a.md <<'EOF'\nIt's a note.\nEOF\ncat > /tmp/b.md <<'EOF'\nThe old command was `find / -name tsc`.\nEOF";
+		expect(hit(command)).toBeNull();
+		expect(maskHeredocBodies(command)).not.toContain("find");
+	});
+
+	test("an unquoted delimiter still expands, so its substitutions still run", () => {
+		expect(hit(`cat <<EOF\n$(rg -rn foo ${HOME})\nEOF`)).toBe(`rg ${HOME} home`);
+	});
+
+	test("a herestring is not a heredoc (its operand is a word)", () => {
+		expect(maskHeredocBodies('echo <<< "hi"')).toBe('echo <<< "hi"');
+	});
+
+	test("<<- strips leading tabs, and bodies are matched one after another", () => {
+		const command = "cat <<-A <<'B'\n\tfind / -name a\n\tA\nbody-b\nB\necho done";
+		expect(maskHeredocBodies(command)).not.toContain("find");
+		expect(maskHeredocBodies(command)).toContain("echo done");
+	});
+
+	test("an unclosed heredoc is left alone, so nothing after it is hidden", () => {
+		// bash fails such a script with "unexpected EOF"; guessing a body would swallow every command after it.
+		const unclosed = "cat <<EOF\nno closing word\n";
+		expect(maskHeredocBodies(unclosed)).toBe(unclosed);
+		expect(hit(`cat <<EOF\nno closing word\nrg -rn foo ${HOME}`)).toBe(`rg ${HOME} home`);
+	});
+
+	test("a `<<` in a comment is not an operator", () => {
+		// Real shape: a comment that documents a heredoc must not hide the next real command.
+		expect(hit(`# example: cat <<EOF\nrg -rn foo ${HOME}`)).toBe(`rg ${HOME} home`);
+	});
+
+	test("a `<<` inside arithmetic or a parameter expansion is a shift, not a heredoc", () => {
+		expect(hit(`echo $(( x << y ))\nrg -rn foo ${HOME}`)).toBe(`rg ${HOME} home`);
+		expect(hit(`(( x << y ))\nrg -rn foo ${HOME}`)).toBe(`rg ${HOME} home`);
+		expect(hit(`echo \${x:-foo <<A B}\nrg -rn foo ${HOME}\nA`)).toBe(`rg ${HOME} home`);
+	});
+
+	test("a `<<` in a quoted string is not an operator", () => {
+		expect(maskHeredocBodies('echo "cat <<EOF"')).toBe('echo "cat <<EOF"');
 	});
 });

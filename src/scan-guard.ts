@@ -191,11 +191,40 @@ export function splitSegmentsDetailed(command: string): SplitSegment[] {
 	const segments: SplitSegment[] = [];
 	let current = "";
 	let currentPiped = false;
+	let inComment = false;
+	let lineStart = 0;
+	/** Last meaningful char outside a comment: tells a continued pipeline from a fresh command. */
+	let lastSignificant = "";
 	let quote: "'" | '"' | null = null;
+
+	const flush = (): void => {
+		if (current.trim() !== "") segments.push({ text: current, piped: currentPiped });
+		current = "";
+	};
+	const mark = (ch: string): void => {
+		if (!/\s/.test(ch)) lastSignificant = ch;
+	};
+
 	for (let i = 0; i < command.length; i++) {
 		const ch = command[i];
+
+		if (inComment) {
+			// The newline itself is not part of the comment's text, so segments stay byte-identical.
+			if (ch === "\n") {
+				inComment = false;
+				flush();
+				// Blank and comment-only lines don't break a pipeline: `producer |`, `# why`, filter.
+				if (lastSignificant !== "|" && lastSignificant !== "&") currentPiped = false;
+				lineStart = i + 1;
+			} else {
+				current += ch;
+			}
+			continue;
+		}
+
 		if (quote === "'") {
 			current += ch;
+			mark(ch);
 			if (ch === "'") quote = null;
 			continue;
 		}
@@ -206,17 +235,25 @@ export function splitSegmentsDetailed(command: string): SplitSegment[] {
 				i++;
 				continue;
 			}
+			mark(ch);
 			if (ch === '"') quote = null;
 			continue;
 		}
 		if (ch === "'" || ch === '"') {
 			quote = ch;
 			current += ch;
+			mark(ch);
 			continue;
 		}
 		if (ch === "\\" && i + 1 < command.length) {
 			current += ch + command[i + 1];
 			i++;
+			continue;
+		}
+		if (ch === "#" && startsComment(command, i, lineStart)) {
+			// A comment is not command text, so it neither feeds a pipe nor opens a quote.
+			inComment = true;
+			current += ch;
 			continue;
 		}
 		if (ch === ";" || ch === "&" || ch === "|" || ch === "\n") {
@@ -227,16 +264,26 @@ export function splitSegmentsDetailed(command: string): SplitSegment[] {
 				current += ch;
 				continue;
 			}
-			if (current.trim() !== "") {
-				segments.push({ text: current, piped: currentPiped });
-				currentPiped = ch === "|" && command[i + 1] !== "|" && command[i - 1] !== "|";
+			flush();
+			// Tracked across every separator, including one with an empty left side, so a slice like
+			// ` | bash` still marks `bash` as pipe-fed.
+			if (ch === "|") {
+				currentPiped = command[i + 1] !== "|" && command[i - 1] !== "|";
+			} else if (ch === "&") {
+				if (command[i - 1] !== "|") currentPiped = false; // `|&` keeps what the `|` set
+			} else if (ch === "\n") {
+				if (lastSignificant !== "|" && lastSignificant !== "&") currentPiped = false;
+				lineStart = i + 1;
+			} else {
+				currentPiped = false;
 			}
-			current = "";
+			lastSignificant = ch === "\n" ? lastSignificant : ch;
 			continue;
 		}
 		current += ch;
+		mark(ch);
 	}
-	if (current.trim() !== "") segments.push({ text: current, piped: currentPiped });
+	flush();
 	return segments;
 }
 
@@ -659,13 +706,530 @@ function findCommandSubstitutionEnd(command: string, start: number): number {
 	return -1;
 }
 
+/** A heredoc body is replaced with this word: plain, so it stays one token. */
+export const HEREDOC_MARKER = "__pi_heredoc__";
+
+/**
+ * Words that mean "a shell may read this body", so the body stays command text.
+ *
+ * The check is deliberately generous: one shell word anywhere on the opening line and nothing is masked.
+ * Not masking only costs the old noise (a body line that looks like a scan gets judged); masking a body
+ * a shell really runs would hide a real command, so the error direction is one-way.
+ *
+ * History has zero shell-fed heredocs (all 1,197 archived ones feed `python3`, `cat` or `git`), so this
+ * list costs nothing today and covers the shapes a shell can actually be reached through: a shell name
+ * behind any wrapper (`timeout 30 bash`, `sudo -E bash`, `env -i sh`, `xargs -I{} sh -c`), glued to an
+ * operator (`|bash`, `&&bash`), after a keyword (`{ bash; }`), via `$SHELL`/`$BASH`, or `source`.
+ */
+const HEREDOC_BODY_IS_CODE = new Set([
+	"bash",
+	"rbash",
+	"sh",
+	"zsh",
+	"rzsh",
+	"dash",
+	"ksh",
+	"ksh93",
+	"rksh",
+	"mksh",
+	"pdksh",
+	"ash",
+	"fish",
+	"csh",
+	"tcsh",
+	"ssh",
+	"su",
+	"eval",
+	"source",
+	// POSIX `.` sources a file — the same reach as `source`.
+	".",
+	"yash",
+	"posh",
+	"oksh",
+	"loksh",
+	"$SHELL",
+	"$BASH",
+	// Braced forms of the same variables (built by joining so lint doesn't read them as placeholders).
+	"$" + "{SHELL}",
+	"$" + "{BASH}",
+]);
+
+/** One parsed `<<` operator. */
+interface HeredocOp {
+	/** Closing word, quotes removed. */
+	delimiter: string;
+	/** `<<-`: leading tabs are stripped before comparing to the delimiter. */
+	stripTabs: boolean;
+	/** Quoted delimiter: the body is literal bytes, so nothing inside it runs. */
+	literal: boolean;
+}
+
+/** Where an operator sits in the command text. */
+interface HeredocOpRange {
+	start: number;
+	end: number;
+	op: HeredocOp;
+	/**
+	 * `0<<'EOF'` / `2<<'EOF'` redirects a descriptor instead of feeding the program's stdin, so a later
+	 * command can still read the body. The body is never masked, but it is still skipped so its prose
+	 * cannot pair with a later delimiter-looking line and mask a real command.
+	 */
+	fdRedirect: boolean;
+}
+
+/** Operators opened on one logical line, plus the body they share. */
+interface HeredocGroup {
+	ranges: HeredocOpRange[];
+	/** Index of the newline that ends the opening logical line. */
+	lineEnd: number;
+	/** Index just past the last closing delimiter line. */
+	bodyEnd: number;
+	/** Commands an unquoted body would still run (`$(...)` / backticks), in order. */
+	expansions: string[];
+}
+
+/**
+ * Read a `<<` / `<<-` operator and its delimiter, or null when it is not one we can read.
+ *
+ * Deliberately refuses rather than guesses: a missed heredoc leaves the body being judged as commands
+ * (the old, noisy-but-safe behaviour), while a wrong guess hides commands the shell really runs.
+ */
+function parseHeredocOperator(command: string, start: number): { op: HeredocOp; end: number } | null {
+	let i = start + 2;
+	if (command[i] === "<") return null; // `<<<` herestring: its operand is a word, not a body
+	let stripTabs = false;
+	if (command[i] === "-") {
+		stripTabs = true;
+		i++;
+	}
+	while (i < command.length && /[ \t]/.test(command[i])) i++;
+	let delimiter = "";
+	let literal = false;
+	while (i < command.length) {
+		const ch = command[i];
+		if (ch === "'" || ch === '"') {
+			const close = command.indexOf(ch, i + 1);
+			if (close === -1) return null;
+			delimiter += command.slice(i + 1, close);
+			literal = true;
+			i = close + 1;
+			continue;
+		}
+		if (ch === "\\") {
+			if (i + 1 >= command.length) return null;
+			delimiter += command[i + 1];
+			literal = true;
+			i += 2;
+			continue;
+		}
+		if (/[\w.-]/.test(ch)) {
+			delimiter += ch;
+			i++;
+			continue;
+		}
+		break;
+	}
+	if (delimiter === "") return null;
+	// `$((1<<2))` / `for ((i=0;i<<3;i++))`: a shift, not a redirect.
+	if (/^\d+$/.test(delimiter)) return null;
+	const after = command[i] ?? "";
+	if (!/^$|[ \t\n;&|<>]/.test(after)) return null;
+	return { op: { delimiter, stripTabs, literal }, end: i };
+}
+
+/**
+ * Index of the newline that ends the logical line containing `from`, or -1 when the command ends first.
+ *
+ * A newline inside quotes, or escaped by a backslash, does not end the line — the opening line of a
+ * heredoc keeps going through both, and everything up to the real end is command text, not a body.
+ * Called only at an operator, which by construction sits outside quotes, so the scan starts unquoted.
+ */
+function logicalLineEnd(command: string, from: number): number {
+	let quote: "'" | '"' | null = null;
+	let substitutions = 0;
+	let backtick = false;
+	let i = from;
+	while (i < command.length) {
+		const ch = command[i];
+		if (quote === "'") {
+			if (ch === "'") quote = null;
+			i++;
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === "\\") {
+				i += 2;
+				continue;
+			}
+			if (ch === '"') quote = null;
+			i++;
+			continue;
+		}
+		if (ch === "\\") {
+			i += 2; // also swallows the newline of a `\`-continuation
+			continue;
+		}
+		if (backtick) {
+			if (ch === "`") backtick = false;
+			i++;
+			continue;
+		}
+		if (ch === "`") {
+			backtick = true;
+			i++;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			i++;
+			continue;
+		}
+		// `$( … )` keeps running across a newline, so the line is not over yet.
+		if (ch === "$" && command[i + 1] === "(") {
+			substitutions++;
+			i += 2;
+			continue;
+		}
+		if (ch === "(" && substitutions > 0) {
+			substitutions++;
+			i++;
+			continue;
+		}
+		if (ch === ")" && substitutions > 0) {
+			substitutions--;
+			i++;
+			continue;
+		}
+		if (ch === "\n" && substitutions === 0) return i;
+		i++;
+	}
+	return -1;
+}
+
+/** Index where the logical line containing `index` starts, walking back over `\`-continued newlines. */
+function logicalLineStartFrom(command: string, anchor: number, index: number): number {
+	let start = anchor;
+	let i = anchor;
+	while (i <= index) {
+		const end = logicalLineEnd(command, i);
+		if (end === -1 || end >= index) break;
+		start = end + 1;
+		i = end + 1;
+	}
+	return start;
+}
+
+/** True when `#` right here starts a comment: at line start, or after a metacharacter that ends a word. */
+function startsComment(command: string, index: number, lineStart: number): boolean {
+	if (index === lineStart) return true;
+	// `${#x}` is a length expansion, not a comment.
+	if (command[index - 1] === "{" && command[index - 2] === "$") return false;
+	return /[\s;&|(){}]/.test(command[index - 1] ?? " ");
+}
+
+/**
+ * Find the first real heredoc operator at or after `from`.
+ *
+ * Skips the places where `<<` is ordinary text: inside quotes, after an unquoted `#` (a comment runs to
+ * the end of the line, so a comment that mentions `<<EOF` opens nothing), inside `((…))` / `$((…))` (a
+ * shift), and inside `${…}` (parameter expansion).
+ */
+function findNextHeredocOperator(command: string, from: number): HeredocOpRange | null {
+	let quote: "'" | '"' | null = null;
+	let arithmetic = 0;
+	let parameter = 0;
+	let lineStart = command.lastIndexOf("\n", from - 1) + 1;
+	let i = from;
+	while (i < command.length) {
+		const ch = command[i];
+		if (quote === "'") {
+			if (ch === "'") quote = null;
+			i++;
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === "\\") {
+				i += 2;
+				continue;
+			}
+			if (ch === '"') quote = null;
+			i++;
+			continue;
+		}
+		if (ch === "\\") {
+			i += 2;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			i++;
+			continue;
+		}
+		if (ch === "\n") {
+			lineStart = i + 1;
+			i++;
+			continue;
+		}
+		if (ch === "#" && startsComment(command, i, lineStart)) {
+			const newlineAt = command.indexOf("\n", i);
+			if (newlineAt === -1) return null;
+			i = newlineAt;
+			continue;
+		}
+		if (ch === "$" && command[i + 1] === "{") {
+			parameter++;
+			i += 2;
+			continue;
+		}
+		if (ch === "}" && parameter > 0) {
+			parameter--;
+			i++;
+			continue;
+		}
+		if (ch === "(" && command[i + 1] === "(") {
+			arithmetic++;
+			i += 2;
+			continue;
+		}
+		if (ch === ")" && command[i + 1] === ")" && arithmetic > 0) {
+			arithmetic--;
+			i += 2;
+			continue;
+		}
+		if (ch === "<" && command[i + 1] === "<" && arithmetic === 0 && parameter === 0) {
+			if (command[i + 2] === "<") {
+				i += 3; // herestring: `<command> <<< word`
+				continue;
+			}
+			const parsed = parseHeredocOperator(command, i);
+			if (parsed) {
+				return { start: i, end: parsed.end, op: parsed.op, fdRedirect: /[0-9]/.test(command[i - 1] ?? "") };
+			}
+		}
+		i++;
+	}
+	return null;
+}
+
+/**
+ * Commands an unquoted heredoc body really runs.
+ *
+ * Quote characters in a body are literal bytes, so a `$(…)` inside `'…'` in the prose still executes —
+ * `splitCommandSubstitutions` would skip it because it reads shell quoting. Only quoting *inside* the
+ * substitution is shell syntax, which `findCommandSubstitutionEnd` already handles.
+ */
+function extractHeredocExpansions(body: string): string[] {
+	const out: string[] = [];
+	let i = 0;
+	while (i < body.length) {
+		const ch = body[i];
+		if (ch === "\\") {
+			i += 2; // `\$` / ``\` `` are literal, so the pair is not an expansion
+			continue;
+		}
+		if (ch === "`") {
+			let end = i + 1;
+			while (end < body.length) {
+				if (body[end] === "\\") {
+					end += 2;
+					continue;
+				}
+				if (body[end] === "`") break;
+				end++;
+			}
+			if (end < body.length) {
+				out.push(body.slice(i + 1, end));
+				i = end + 1;
+				continue;
+			}
+			break;
+		}
+		if (ch === "$" && body[i + 1] === "(") {
+			const end = findCommandSubstitutionEnd(body, i + 2);
+			if (end !== -1) {
+				out.push(body.slice(i + 2, end));
+				i = end + 1;
+				continue;
+			}
+		}
+		i++;
+	}
+	return out;
+}
+
+/**
+ * Pair the operators opened on one logical line with the body they share.
+ *
+ * Returns the operator's end as `end` when no group could be resolved: an unclosed heredoc is a syntax
+ * error in bash, so guessing would swallow every command after it. `end` is also how the caller stays
+ * linear — see {@link maskHeredocBodies}.
+ */
+function resolveHeredocGroup(command: string, first: HeredocOpRange): { group: HeredocGroup | null; end: number } {
+	const ranges: HeredocOpRange[] = [first];
+	let last = first;
+	let lineEnd = logicalLineEnd(command, last.end);
+	while (lineEnd !== -1) {
+		const next = findNextHeredocOperator(command, last.end);
+		if (!next || next.start > lineEnd) break;
+		ranges.push(next);
+		last = next;
+		lineEnd = logicalLineEnd(command, last.end);
+	}
+	if (lineEnd === -1) return { group: null, end: command.length };
+	let pos = lineEnd + 1;
+	const expansions: string[] = [];
+	for (const range of ranges) {
+		const bodyStart = pos;
+		let closed = false;
+		while (pos < command.length) {
+			const newlineAt = command.indexOf("\n", pos);
+			const end = newlineAt === -1 ? command.length : newlineAt;
+			const line = command.slice(pos, end);
+			const compared = range.op.stripTabs ? line.replace(/^\t+/, "") : line;
+			pos = newlineAt === -1 ? command.length : newlineAt + 1;
+			if (compared === range.op.delimiter) {
+				closed = true;
+				break;
+			}
+		}
+		if (!closed) return { group: null, end: command.length };
+		if (!range.op.literal) {
+			// Unquoted delimiter: the body still expands `$(...)` and backticks, and those really run.
+			expansions.push(...extractHeredocExpansions(command.slice(bodyStart, pos)));
+		}
+	}
+	return { group: { ranges, lineEnd, bodyEnd: pos, expansions }, end: pos };
+}
+
+/** `sudo` flags that start a shell with the heredoc on stdin. */
+const SUDO_SHELL_FLAGS = new Set(["-s", "-i", "--shell", "--login"]);
+
+/** True when one token names a shell: `bash`, `|bash`, `(bash)`, `$SHELL`, `/bin/sh`. */
+function tokenIsShell(token: string): boolean {
+	// Raw first: stripping would turn `${BASH}` into `${BASH` and lose the match.
+	if (HEREDOC_BODY_IS_CODE.has(token)) return true;
+	const cleaned = token.replace(/^[^A-Za-z0-9_$/.-]+/, "").replace(/[^A-Za-z0-9_$/.-]+$/, "");
+	if (cleaned === "") return false;
+	if (HEREDOC_BODY_IS_CODE.has(cleaned)) return true;
+	// `$'bash'` / `$"bash"` tokenize to `$bash`; the `$` is a quoting prefix, not part of the name.
+	const program = basename(cleaned).replace(/^\$/, "");
+	return HEREDOC_BODY_IS_CODE.has(program);
+}
+
+/**
+ * True when anything on the opening line names a way into a shell, so the body is a script, not data.
+ *
+ * Token-level on purpose: `timeout --signal KILL 5 bash` and `f() { bash; }` have no single "program
+ * token" to inspect, but they do contain a shell name.
+ */
+function heredocFeedsShell(header: string): boolean {
+	// Raw tokens too: `stripRedirections` deletes `>(bash)`, a process substitution that runs a shell.
+	const tokens = [...tokenizeSegment(header), ...tokenizeSegment(stripRedirections(header))];
+	if (tokens.some(tokenIsShell)) return true;
+	// `sudo -s` / `sudo -i` start a root shell with this body on stdin; the shell name is the flag.
+	const sudoShell = tokens.includes("sudo") || tokens.includes("su");
+	return sudoShell && tokens.some((token) => SUDO_SHELL_FLAGS.has(token));
+}
+
+/** How many lines after a body may hold the shell that consumes it. */
+const CONSUMER_LOOKAHEAD_LINES = 12;
+
+/** The lines after a body that may hold the shell consuming it: blanks and comments skipped, bounded. */
+function consumerAfterBody(command: string, from: number): string {
+	// Look a few lines ahead, not just one: a compound group's consumer (`} | bash`) can sit below the
+	// body with an ordinary command line in between, and that line is part of the generated script.
+	const lines: string[] = [];
+	let start = from;
+	let end = logicalLineEnd(command, start);
+	let scanned = 0;
+	while (end !== -1 && scanned < CONSUMER_LOOKAHEAD_LINES) {
+		const line = command.slice(start, end);
+		const trimmed = line.trim();
+		if (trimmed !== "" && !trimmed.startsWith("#")) lines.push(line);
+		if (heredocFeedsShell(line)) break;
+		start = end + 1;
+		end = logicalLineEnd(command, start);
+		scanned++;
+	}
+	if (end === -1) lines.push(command.slice(start));
+	return lines.join("\n");
+}
+
+/**
+ * Replace heredoc bodies with {@link HEREDOC_MARKER} so their text is never read as commands.
+ *
+ * Without this, the body of `git commit -F - <<'EOF' … EOF` is scanned as if the shell would run every
+ * line of the commit message: a binary name in the prose was blocked as a filesystem scan (it really
+ * happened, twice in one session), and 42 of the 1,197 archived heredoc commands were capped to a 300s
+ * timeout for a scan that does not exist. 98% of those heredocs quote the delimiter, so the body is
+ * pure bytes.
+ *
+ * Scanning resumes *after* each removed body, so an apostrophe or `${` in prose cannot leak quote state
+ * into the next heredoc. An unquoted delimiter keeps its executing part: the collected `$(...)` /
+ * backtick contents are appended as their own segments, so they are still judged.
+ *
+ * A body a shell may read is left alone — see {@link heredocFeedsShell}.
+ */
+export function maskHeredocBodies(command: string): string {
+	if (!command.includes("<<")) return command;
+	let out = "";
+	let cursor = 0;
+	let scanFrom = 0;
+	while (scanFrom < command.length) {
+		const first = findNextHeredocOperator(command, scanFrom);
+		if (!first) break;
+		const resolved = resolveHeredocGroup(command, first);
+		if (!resolved.group) {
+			// Unclosed: bash rejects the script, so nothing runs. Stop instead of rescanning the tail.
+			scanFrom = resolved.end;
+			continue;
+		}
+		const group = resolved.group;
+		if (first.fdRedirect) {
+			// Descriptor redirect: the body stays command text, but scanning resumes past it so its
+			// prose cannot pair with a later delimiter-looking line.
+			scanFrom = group.bodyEnd;
+			continue;
+		}
+		// Start of the logical line holding the operator. `scanFrom` is always a line boundary (0 or a
+		// body end), so this is a forward walk — and it cannot reach back into a removed body.
+		const lineStart = logicalLineStartFrom(command, scanFrom, first.start);
+		if (
+			heredocFeedsShell(command.slice(lineStart, group.lineEnd)) ||
+			// The consumer can be named after the body: `{ cat <<EOF … EOF ; } | bash`. Blank lines and
+			// comment lines in between belong to the same group, so they are skipped, not treated as the
+			// consumer.
+			heredocFeedsShell(consumerAfterBody(command, group.bodyEnd))
+		) {
+			// Skip the whole group: the remaining bodies on this line share the same shell, and
+			// re-evaluating them would look at a header slice with the shell word cut off.
+			scanFrom = group.bodyEnd;
+			continue;
+		}
+		for (const range of group.ranges) {
+			out += `${command.slice(cursor, range.start)} ${HEREDOC_MARKER} `;
+			cursor = range.end;
+		}
+		out += command.slice(cursor, group.lineEnd);
+		out += "\n";
+		for (const expansion of group.expansions) out += `; ${expansion} `;
+		out += "\n";
+		cursor = group.bodyEnd;
+		scanFrom = group.bodyEnd;
+	}
+	out += command.slice(cursor);
+	return out;
+}
+
 /** Parse every `find`/`grep`/`rg`/`du`/`tree` scan root in the command, in order of appearance. */
 export function parseScanCommands(command: string, depth = 0): ParsedScan[] {
 	const out: ParsedScan[] = [];
 	if (!command || depth > 8) return out;
-	for (const nested of extractNestedCommands(command)) out.push(...parseScanCommands(nested, depth + 1));
-	for (const words of extractForWordLists(command)) out.push(...parseScanCommands(words, depth + 1));
-	for (const segment of splitSegmentsDetailed(command)) {
+	// Heredoc bodies are text handed to a program, not commands this shell will run.
+	const masked = maskHeredocBodies(command);
+	for (const nested of extractNestedCommands(masked)) out.push(...parseScanCommands(nested, depth + 1));
+	for (const words of extractForWordLists(masked)) out.push(...parseScanCommands(words, depth + 1));
+	for (const segment of splitSegmentsDetailed(masked)) {
 		const tokens = stripWrappers(tokenizeSegment(stripRedirections(segment.text)));
 		if (tokens.length === 0) continue;
 		const tool = basename(tokens[0]);

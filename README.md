@@ -39,6 +39,21 @@ Five things (the loop guard, the arg guard, and the fence are hard; the hint and
    a deliberate `timeout 600` was pulled to 300s and killed mid-run). Only a segment that starts on its
    own (`;`, `&&`, `||`, newline) is a scan worth capping. Non-search commands are **left completely
    alone** — long runners like `tail -f`/`watch`/foreground servers keep going.
+3.2. **Read command text, not heredoc bodies**: before any command is parsed (`scan-guard` and the byte-
+   limit `classify`), each heredoc body is replaced with a `__pi_heredoc__` placeholder. A body is data
+   handed to `python3`/`cat`/`git`, not something this shell runs — without this, a commit message
+   quoting `` `find / -name tsc` `` was blocked as a filesystem scan, and **42** archived commands were
+   silently capped for a scan that does not exist. Kept as command text: an unquoted delimiter's
+   `$(...)`/backtick contents (those really run), any body a shell may read — one shell word anywhere on
+   the opening line is enough (`bash <<'EOF'`, `{ bash; }`, `timeout 30 bash`, `sudo --user root bash`,
+   `$SHELL`/`$BASH`/`${BASH}`, `eval bash`, `rzsh`, `yash`, `source /dev/stdin` or its POSIX synonym
+   `. /dev/stdin`, `$'bash'`, `<<'EOF' bash`, `cat <<EOF |bash`) — and anything it cannot read
+   confidently: a `<<` inside a comment, inside `((…))`/`$((…))`, inside `${…}`, a `<<<` herestring, a
+   `0<<'EOF'` descriptor redirect, or a heredoc whose closing word never appears (bash rejects that
+   script anyway). The body starts after the *logical* line, so a `\`-continued, in-quote or
+   inside-`$( … )` newline on the opening line stays command text, and scanning resumes after each
+   removed body so an apostrophe in one body cannot hide the next heredoc.
+   Real numbers: 1,197 heredocs in the archive, 1,171 of them quoting the delimiter, 0 fed to a shell.
 3.5. **Catch silent same-shape death loops (hard)**: at `tool_call`, reduce the command to a shape
    (program + subcommand, variable args dropped, `cd dir && …` chains judged by the real command) and
    walk the session branch backwards: if the same shape has fired **35 times in a row with no
@@ -297,10 +312,55 @@ process it shows `🛡 read-only` and `🛡 read-only ×N` (fence blocks only).
 - **Why a pipe-fed search is exempt from the cap**: the cap is about a tree walk, and `producer | grep`
   walks nothing — the producer is the long part, and it is not a search command. Audit of the full
   session history: 829 of 4,091 search-bearing commands were pipe-fed filters only, and one of them was
-  killed mid-run after a deliberate `timeout 600` got pulled to 300s.
+  killed mid-run after a deliberate `timeout 600` got pulled to 300s. A `|` inside a comment is text, not
+  a pipe, and a blank line does not end a pipeline.
 - **Why leave all other commands alone**: `tail -f`/`watch`/foreground servers are meant to run long;
   hard-blocking would only push the model to write `timeout: 999999` and bypass it. Putting the limit
   only on "search" — the one class with a definite bounded need — keeps friction lowest.
+- **Why heredoc bodies are masked instead of just skipped**: skipping the body text would hide commands
+  the shell *does* run. So the mask has three exits: an unquoted delimiter keeps its `$(...)` contents,
+  a body a shell may read is left intact, and anything unreadable is left as plain command text.
+  "May read a shell" is checked generously — one shell word (`bash`, `rbash`, `sh`, `zsh`, `rzsh`,
+  `dash`, `ksh`, `mksh`, `ash`, `fish`, `csh`, `tcsh`, `yash`, `posh`, `oksh`, `loksh`, `ssh`, `su`, `eval`,
+  `source`, `.`, `$SHELL`, `$BASH`) anywhere on the opening line disables the mask, because finding
+  "the" program means out-guessing
+  `timeout --signal KILL 5 bash`, `f() { bash; }`, `cat <<EOF |bash` and `cat <<EOF | (bash)`.
+  Real history loses nothing to this: 0 of the 1,197 archived heredocs feed a shell.
+- **Why the body is scanned for expansions without shell quoting**: in a heredoc body `'…'` is literal
+  bytes, so `$(…)` inside quotes still runs. A quote-aware scan would drop a command that really
+  executes (`git commit -F - <<EOF` + prose `don't run $(…) here`), which is the incident's own domain.
+- **Why a descriptor heredoc is skipped, not left in place**: `2<<EOF` is not a stdin redirect, so its
+  body stays command text — but if the masker kept scanning inside it, a prose `cat <<X` in that body
+  could pair with a later `X` line and swallow a real command. The body is skipped unmasked.
+- **Why the body starts after the logical line**: a newline that is backslash-escaped, falls inside a
+  quoted argument, or sits inside `$( … )` / backticks keeps the opening line going in bash. Reading the
+  body from the first physical newline pulled that line into the body and hid real scans — found by an
+  adversarial verifier, now covered by tests.
+- **Known gap (data flow, not fixable textually)**: a heredoc inside a substitution —
+  `bash -c "$(cat <<'EOF' … EOF)"`, `eval "$(cat <<'EOF' … EOF)"`, `git commit -m "$(cat …)"` — has its
+  body masked by the nested parse, so what the substitution *does with* the text is not judged. This is
+  the same class as `eval`/`-c` on a variable, and it is an accepted blind spot; the guard never
+  followed text from a value into a command.
+- **Why the consumer may be named after the body**: `{ cat <<EOF … EOF ; } | bash` and `cat <<EOF | tee
+  >(bash)` run the body too, but the shell word is past the closing delimiter (or inside a process
+  substitution that `stripRedirections` deletes). So the check looks at the opening line *and* at up to
+  12 lines after the body — skipping blank and comment-only lines, following `\` continuations — and
+  tokenizes the raw header as well as the redirection-stripped one.
+- **Why a shell-fed group skips every body on its line**: in `bash <<A <<B` only the *last* body reaches
+  the shell, so the remaining operators are resolved as one group and left alone; re-evaluating them one
+  by one looked at a header with the shell word cut off and masked an executed body.
+- **Known gap (bounded, not fixed)**: a consumer further than 12 lines below the body, or reached through
+  a wrapper defined on an earlier line (`run_sh() { bash; }` then `run_sh <<EOF`), is not detected. Going
+  wider costs a scan per heredoc, and no archive command looks like that.
+- **Why an unclosed opener stops the scan**: bash rejects that script (`unexpected EOF`), so nothing
+  runs, and no later heredoc in the same command is real. Stopping also keeps the helper linear —
+  rescanning the tail per unclosed opener was quadratic (1.8s on 50KB of `cat <<EOF` repeats). The
+  remaining super-linear shape is thousands of `<<` operators on one line (~0.7s at 3,000); no real
+  command looks like that.
+- **Why scanning resumes after each removed body**: the operator scan is quote-aware, and a body is not
+  shell text, so an apostrophe in prose (`It's a note.`) must not open a quote state that hides the next
+  heredoc's `<<`. Resuming after the body instead of pre-scanning the whole string fixes that; the same
+  applies to `${` and `((` inside prose.
 
 ## Development
 
@@ -320,7 +380,7 @@ src/audit.ts          the /bash-guard audit prompt: what to scan, how to stay bo
 src/analyze.ts        size checks, built-in footer removal, preview trim, repeat folding, signal pickup
 src/classify.ts       command classes: process output / build-test / valuable payload (strict allowlist, word list from claude-code)
 src/suggest.ts        command heuristics -> rewrite hints
-src/scan-guard.ts     scan parsing: quote-aware segment split + tokenizer + find/grep/rg/du/tree root check
+src/scan-guard.ts     scan parsing: quote-aware segment split + tokenizer + heredoc masking + find/grep/rg/du/tree root check
 src/streak-guard.ts   shape normalization + silent same-shape streak measurement (death-loop breaker)
 src/read-only.ts      the read-only allow list: judge a command, and read the fence mode from the env
 src/timeout-guard.ts  5-minute timeout cap for search commands (pure helper)

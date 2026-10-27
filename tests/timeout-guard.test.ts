@@ -90,4 +90,12 @@ describe("a search program that only filters a pipe is not the workload", () => 
 	test("a pipe inside a quoted pattern does not make the command a filter", () => {
 		expect(inject('rg -n "a|b" src')).toBe(SEARCH_TIMEOUT_SECONDS);
 	});
+
+	test("a newline right after the pipe is a continuation, not a new command", () => {
+		// Real shape: a long runner wrapped over two lines with the filter on the second line.
+		expect(inject('npm run build 2>&1 |\n  grep -E "FAIL|error"')).toBeNull();
+		expect(inject('pre-commit run --all-files |\n  grep -E "Failed|error"')).toBeNull();
+		expect(inject("printf 'a\\n' |& \nrg foo ~")).toBeNull();
+		expect(inject("a | \n rg foo src")).toBeNull();
+	});
 });

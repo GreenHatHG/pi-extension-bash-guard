@@ -116,4 +116,16 @@ describe("classifyCommand", () => {
 		// includes a command off the list (awk is a read, but python is clearer here)
 		expect(classifyCommand("rg foo . | python -c 'print(1)'")).toBe("unknown");
 	});
+
+	test("A heredoc body does not decide the byte limit (it is not run by this shell)", () => {
+		// Real case: writing a JSON config, where the body's JSON braces made it `unknown` (30KB) while the
+		// visible output came from the trailing `ls` (process noise, 8KB).
+		expect(classifyCommand("cd /tmp && cat > tsconfig.json <<'EOF'\n{\n  \"a\": {}\n}\nEOF\nls")).toBe("exhaust");
+	});
+
+	test("A heredoc fed to a shell keeps its body visible to the parser", () => {
+		// The delimiter line itself is off the command list, so this stays `unknown` either way; what
+		// matters is that the body is still *seen* — see the scan-guard tests for the block itself.
+		expect(classifyCommand("bash <<'EOF'\nnpm run build\nEOF")).toBe("unknown");
+	});
 });

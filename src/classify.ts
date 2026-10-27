@@ -14,7 +14,15 @@
  *   model wants, so wide limit, no lecturing, no escalation count.
  */
 
-import { ASSIGNMENT, basename, splitSegments, stripRedirections, stripWrappers, tokenizeSegment } from "./scan-guard";
+import {
+	ASSIGNMENT,
+	basename,
+	maskHeredocBodies,
+	splitSegments,
+	stripRedirections,
+	stripWrappers,
+	tokenizeSegment,
+} from "./scan-guard";
 
 /** Command bucket. */
 export type CommandClass = "exhaust" | "build-test" | "unknown";
@@ -178,7 +186,8 @@ function segmentKind(tokens: string[]): SegmentKind {
  */
 export function classifyCommand(command: string): CommandClass {
 	const kinds: SegmentKind[] = [];
-	for (const segment of splitSegments(command)) {
+	// A heredoc body is text for a program, not commands: its prose must not decide the byte limit.
+	for (const segment of splitSegments(maskHeredocBodies(command))) {
 		const raw = dropLeadingAssignments(tokenizeSegment(stripRedirections(segment)));
 		const stripped = stripWrappers(raw);
 		// `env` / `xargs` are both wrapper and command: fall back to raw tokens when stripping
